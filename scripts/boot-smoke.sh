@@ -33,8 +33,8 @@ case "$image" in
     /dev/*) echo "refusing an image path under /dev" >&2; exit 2 ;;
 esac
 [ -f "$image" ] || { echo "image not found: $image" >&2; exit 2; }
-assert_no_other_qemu
-assert_guest_fits "$memory"
+hold=""
+hold=$(sbm_reserve graphical "$memory" 2 "$root")
 mkdir -p "$evidence"
 image=$(cd "$(dirname "$image")" && pwd)/$(basename "$image")
 
@@ -76,6 +76,10 @@ cleanup_qemu() {
         sleep 1
         kill -9 "$pid" 2>/dev/null || true
     fi
+    if [ -n "${hold:-}" ]; then
+        sbm_release "$hold" || true
+        hold=""
+    fi
 }
 trap cleanup_qemu EXIT
 
@@ -99,6 +103,7 @@ else
     echo "unknown arch $arch" >&2
     exit 2
 fi
+sbm_attach "$hold" "$pid"
 
 python3 - "$qmp" "$evidence" "$serial" "$timeout" "$pid" <<'PY'
 import json, os, socket, sys, time

@@ -1,7 +1,15 @@
 #!/bin/bash
-# Host limits for QEMU launched by this repo.
+# Default guest size for this repo.
 # On 2026-11-26 an 8192 MiB aarch64 guest was idle at 533 MiB inside the
 # guest and still charged a 15 GB phys_footprint on a 16 GB Mac.
+# Admission for every SBM repo is `sbm-lab resources`, not the checks below.
+# Those checks are per shell and are not the cross-checkout lock.
+
+_sbm_resources=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../sbm-lab/scripts" && pwd)/sbm-resources.sh
+if [ -f "$_sbm_resources" ]; then
+    # shellcheck disable=SC1091
+    source "$_sbm_resources"
+fi
 
 host_memory_mib() {
     local bytes

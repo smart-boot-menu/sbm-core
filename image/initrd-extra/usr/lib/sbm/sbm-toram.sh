@@ -69,5 +69,5 @@ fi
 printf '%s\n' backing-protected > "$MARKER"
 printf '%s\n' "$SRC" > /run/sbm/root-source
 printf '%s\n' "$SIZE" > /run/sbm/root-bytes
-echo "<6>SBM_TORAM_MODE=backing-protected" > /dev/kmsg 2>/dev/null || true
+echo "<6>SBM_TORAM_MODE=backing-protected src=${SRC:-missing} bytes=${SIZE} mem_kib=${MEM_KIB} need=${NEED}" > /dev/kmsg 2>/dev/null || true
 exit 0

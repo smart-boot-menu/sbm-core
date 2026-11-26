@@ -54,12 +54,18 @@ finalize() {
         python3 "${root}/scripts/finalize-image.py"
 }
 
-sudo /usr/local/bin/mkosi --force build --architecture=arm64 \
-    --extra-tree="${root}/build/staging/aarch64-unknown-linux-gnu"
-finalize arm64
-sudo /usr/local/bin/mkosi --force build --architecture=x86-64 \
-    --extra-tree="${root}/build/staging/x86_64-unknown-linux-gnu"
-finalize x86-64
+# SBM_ARCHES="arm64" or "x86-64" builds one image. The default builds both.
+arches=${SBM_ARCHES:-"arm64 x86-64"}
+for arch in $arches; do
+    case "$arch" in
+        arm64) triple=aarch64-unknown-linux-gnu ;;
+        x86-64) triple=x86_64-unknown-linux-gnu ;;
+        *) echo "unknown architecture: $arch" >&2; exit 2 ;;
+    esac
+    sudo /usr/local/bin/mkosi --force build --architecture="$arch" \
+        --extra-tree="${root}/build/staging/${triple}"
+    finalize "$arch"
+done
 sudo chmod -R a+rX build/images
 echo "images:"
 ls -lh build/images

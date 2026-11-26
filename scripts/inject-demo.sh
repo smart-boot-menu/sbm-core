@@ -25,5 +25,8 @@ sudo mount "${loop}p1" "$mnt"
 sudo mkdir -p "$mnt/EFI/sbm/handoff" "$mnt/EFI/sbm/state"
 sudo cp "$handoff" "$mnt/EFI/sbm/handoff/current.json"
 echo smoke | sudo tee "$mnt/EFI/sbm/state/smoke" >/dev/null
+if [ "${SBM_RENDERER:-}" = "software" ]; then
+    echo software | sudo tee "$mnt/EFI/sbm/state/renderer" >/dev/null
+fi
 sync
 echo "demo image $dest"

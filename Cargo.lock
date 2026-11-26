@@ -2464,6 +2464,7 @@ dependencies = [
 name = "sbm-cored"
 version = "0.1.0"
 dependencies = [
+ "rustix 0.38.44",
  "sbm-protocol",
  "sbm-runtime",
  "sbm-types",

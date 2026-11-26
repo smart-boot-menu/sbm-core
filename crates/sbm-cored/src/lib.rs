@@ -883,8 +883,11 @@ fn error(message: impl Into<String>, code: Option<SbmErrorCode>) -> Handled {
 
 #[cfg(target_os = "linux")]
 fn peer_allowed(stream: &UnixStream) -> bool {
-    match stream.peer_cred() {
-        Ok(cred) => cred.uid() == 0 || cred.uid() == 1000,
+    // `UnixStream::peer_cred` is still unstable on Rust 1.100 (feature
+    // `peer_credentials_unix_socket`). rustix reads `SO_PEERCRED` instead.
+    use std::os::fd::AsFd;
+    match rustix::net::sockopt::get_socket_peercred(stream.as_fd()) {
+        Ok(cred) => cred.uid.as_raw() == 0 || cred.uid.as_raw() == 1000,
         Err(_) => false,
     }
 }

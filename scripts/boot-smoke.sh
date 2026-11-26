@@ -201,7 +201,11 @@ done
     echo "accel=$accel"
     echo "memory_mib=$memory"
     echo "image=$image"
-    echo "qemu=$("$qemu_aarch64" --version | head -n 1)"
+    if [ "$arch" = "arm64" ]; then
+        echo "qemu=$("$qemu_aarch64" --version | head -n 1)"
+    else
+        echo "qemu=$("$qemu_x86" --version | head -n 1)"
+    fi
     echo "finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } >"$evidence/meta.txt"
 echo "evidence in $evidence"

@@ -64,9 +64,17 @@ def main() -> int:
     arch = os.environ["ARCHITECTURE"]
     pretty = ARCH_NAME[arch]
     output_dir = pathlib.Path(os.environ["OUTPUTDIR"])
-    raws = sorted(path for path in output_dir.glob("*.raw") if path.is_file())
+    # Both architectures share OutputDirectory. Match this build's name
+    # (`sbm-core-arm64_0.1.0.raw` or `sbm-core-x86-64.raw`) and ignore the other.
+    raws = sorted(
+        path
+        for path in output_dir.glob("*.raw")
+        if path.is_file()
+        and not path.is_symlink()
+        and (f"-{arch}_" in path.name or path.name.endswith(f"-{arch}.raw"))
+    )
     if len(raws) != 1:
-        print(f"expected one raw image in {output_dir}, found {raws}", file=sys.stderr)
+        print(f"expected one {arch} raw image in {output_dir}, found {raws}", file=sys.stderr)
         return 1
     image = raws[0]
     mountpoint = pathlib.Path(tempfile.mkdtemp(prefix="sbm-esp-"))

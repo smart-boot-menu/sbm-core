@@ -8,6 +8,9 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"
 export XDG_SESSION_TYPE=wayland
 mkdir -p "$XDG_RUNTIME_DIR" /var/lib/sbm
 chmod 700 "$XDG_RUNTIME_DIR" || true
+# virtio-gpu has no GLES unless the host enables virgl. Allow pixman so the
+# desktop still comes up. Explicit software mode below forces it.
+export WLR_RENDERER_ALLOW_SOFTWARE=1
 
 software=0
 if grep -q 'sbm.renderer=software' /proc/cmdline 2>/dev/null; then
@@ -21,7 +24,6 @@ if [ "$software" -eq 1 ]; then
     export ICED_BACKEND=tiny-skia
     export LIBGL_ALWAYS_SOFTWARE=1
     export GALLIUM_DRIVER=llvmpipe
-    export WLR_RENDERER_ALLOW_SOFTWARE=1
 fi
 
 (

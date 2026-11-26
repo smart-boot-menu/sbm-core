@@ -38,10 +38,22 @@ chmod 755 mkosi.postinst.chroot mkosi.postoutput \
     image/initrd-extra/usr/lib/sbm/sbm-toram.sh
 
 mkdir -p build/images build/mkosi-cache build/mkosi-pkgcache build/mkosi-build
+version=$(tr -d '[:space:]' < mkosi.version)
+
+finalize() {
+    sudo env \
+        ARCHITECTURE="$1" \
+        OUTPUTDIR="${root}/build/images" \
+        IMAGE_VERSION="${version}" \
+        python3 "${root}/scripts/finalize-image.py"
+}
+
 sudo /usr/local/bin/mkosi --force build --architecture=arm64 \
     --extra-tree="${root}/build/staging/aarch64-unknown-linux-gnu"
+finalize arm64
 sudo /usr/local/bin/mkosi --force build --architecture=x86-64 \
     --extra-tree="${root}/build/staging/x86_64-unknown-linux-gnu"
+finalize x86-64
 sudo chmod -R a+rX build/images
 echo "images:"
 ls -lh build/images

@@ -2,6 +2,9 @@
 # Boot a built SBM Core disk image with Homebrew QEMU.
 # aarch64 uses HVF. x86-64 uses TCG; say so when reporting that run.
 set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck disable=SC1091
+source "${root}/scripts/host-resources.sh"
 
 usage() {
     echo "usage: boot-smoke.sh --arch arm64|x86-64 --image PATH --memory MIB [--scratch] [--timeout SEC] --evidence DIR" >&2
@@ -30,6 +33,8 @@ case "$image" in
     /dev/*) echo "refusing an image path under /dev" >&2; exit 2 ;;
 esac
 [ -f "$image" ] || { echo "image not found: $image" >&2; exit 2; }
+assert_no_other_qemu
+assert_guest_fits "$memory"
 mkdir -p "$evidence"
 image=$(cd "$(dirname "$image")" && pwd)/$(basename "$image")
 
@@ -64,6 +69,15 @@ common=(
     -drive "if=none,id=hd,file=${image},format=raw"
     -device virtio-blk-pci,drive=hd
 )
+
+cleanup_qemu() {
+    if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        sleep 1
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+}
+trap cleanup_qemu EXIT
 
 if [ "$arch" = "arm64" ]; then
     "$qemu_aarch64" -name sbm-core-arm64 \

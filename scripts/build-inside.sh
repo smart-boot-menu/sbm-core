@@ -7,7 +7,13 @@ cd "$(dirname "$0")/.."
 root=$(pwd)
 # shellcheck disable=SC1091
 source "${HOME}/.cargo/env"
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+mem_kib=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+if [ "${mem_kib:-0}" -lt 5242880 ]; then
+    default_jobs=1
+else
+    default_jobs=2
+fi
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$default_jobs}"
 
 rustup target add aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
 cargo build --release --locked --target aarch64-unknown-linux-gnu

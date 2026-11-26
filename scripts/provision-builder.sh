@@ -12,6 +12,7 @@ sudo dnf -y install --setopt=install_weak_deps=False \
     erofs-utils sbsigntools openssl mtools \
     gcc make gcc-c++ \
     gcc-x86_64-linux-gnu binutils-x86_64-linux-gnu \
+    sysroot-x86_64-fc45-glibc \
     distribution-gpg-keys bubblewrap \
     zstd e2fsprogs dosfstools parted util-linux rsync \
     qemu-user-static-x86 \
@@ -32,6 +33,42 @@ if [ ! -x /opt/mkosi/bin/mkosi ]; then
 fi
 sudo ln -sfn /opt/mkosi/bin/mkosi /usr/local/bin/mkosi
 /usr/local/bin/mkosi --version
+
+# The cross gcc looks in /usr/x86_64-linux-gnu/sys-root, but Fedora ships the
+# glibc sysroot under /usr/x86_64-redhat-linux/sys-root/fc45 and its libc.so
+# uses absolute paths. A wrapper passes --sysroot. Fedora publishes no
+# libatomic or libgcc sysroot, so those two x86_64 libraries are unpacked
+# from the matching rpms.
+sysroot=/usr/x86_64-redhat-linux/sys-root/fc45
+if [ ! -e "${sysroot}/usr/lib64/libatomic.so" ]; then
+    work=$(mktemp -d)
+    sudo dnf -y download --forcearch=x86_64 --destdir "$work" libatomic libgcc
+    mkdir -p "${work}/tree"
+    for rpm in "$work"/*.rpm; do
+        rpm2cpio "$rpm" | (cd "${work}/tree" && cpio -idmu)
+    done
+    sudo mkdir -p "${sysroot}/usr/lib64" "${sysroot}/lib64"
+    sudo cp -a "${work}/tree/usr/lib64/libatomic.so."* "${sysroot}/usr/lib64/"
+    sudo cp -a "${work}/tree/lib64/libgcc_s"* "${sysroot}/lib64/"
+    sudo cp -a "${work}/tree/lib64/libgcc_s"* "${sysroot}/usr/lib64/"
+    sudo ln -sfn libatomic.so.1 "${sysroot}/usr/lib64/libatomic.so"
+    sudo ln -sfn libgcc_s.so.1 "${sysroot}/usr/lib64/libgcc_s.so"
+    sudo ln -sfn libgcc_s.so.1 "${sysroot}/lib64/libgcc_s.so"
+    rm -rf "$work"
+fi
+gccdir=$(echo /usr/lib/gcc/x86_64-linux-gnu/*)
+if [ ! -f "${gccdir}/libatomic_asneeded.so" ]; then
+    sudo tee "${gccdir}/libatomic_asneeded.so" >/dev/null <<'EOF'
+/* GNU ld script */
+OUTPUT_FORMAT(elf64-x86-64)
+INPUT ( AS_NEEDED ( -latomic ) )
+EOF
+fi
+sudo tee /usr/local/bin/x86_64-linux-gnu-gcc >/dev/null <<'EOF'
+#!/bin/bash
+exec /usr/bin/x86_64-linux-gnu-gcc --sysroot=/usr/x86_64-redhat-linux/sys-root/fc45 "$@"
+EOF
+sudo chmod 755 /usr/local/bin/x86_64-linux-gnu-gcc
 
 if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \

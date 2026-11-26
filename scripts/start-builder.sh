@@ -18,7 +18,8 @@ qemu_pid() {
             return 0
         fi
     fi
-    ps -axo pid=,command= | LC_ALL=C awk '/qemu-system-aarch64/ && /sbm-builder/ { print $1; exit }'
+    # Match the QEMU executable, not this awk line, which also contains the name.
+    ps -axo pid=,comm=,args= | LC_ALL=C awk '$2 == "qemu-system-aarch64" && / -name sbm-builder/ { print $1; exit }'
 }
 
 stop_builder() {
@@ -95,7 +96,9 @@ fi
 
 mkdir -p "$dir"
 cd "$dir"
-/opt/homebrew/bin/qemu-system-aarch64 \
+# A new session so the launching shell can exit without killing QEMU.
+python3 -c 'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
+    /opt/homebrew/bin/qemu-system-aarch64 \
     -name sbm-builder \
     -machine virt,accel=hvf,highmem=on,gic-version=3 \
     -cpu host \
@@ -111,7 +114,8 @@ cd "$dir"
     -device virtio-net-pci,netdev=net \
     -display none \
     -serial file:serial.log \
-    -monitor none &
+    -monitor none \
+    </dev/null >>qemu.log 2>&1 &
 echo $! >"$pidfile"
 echo "builder started pid=$(cat "$pidfile") memory_mib=${mem} cpus=${cpus} accel=hvf"
 known="${dir}/known_hosts"

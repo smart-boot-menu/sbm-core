@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod catalog;
 pub mod discover;
 pub mod handoff;
 pub mod hostinfo;
@@ -12,6 +13,7 @@ pub mod ipc;
 pub mod plan;
 pub mod toram;
 
+pub use catalog::inspect_catalog_plan;
 pub use discover::{DiscoveredDisk, DiscoveredPartition, InstalledOs, parse_lsblk};
 pub use handoff::{HandoffLoad, launch_mode_label, load_handoff};
 pub use ipc::{

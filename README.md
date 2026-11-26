@@ -11,6 +11,7 @@ Independently bootable, immutable, modular, RAM-capable minimal Linux management
 - Adaptive RAM mode when `MemTotal` is at least 3584 MiB and the image plus 1536 MiB of headroom fits. Smaller machines keep the root on the backing disk and protect that disk.
 - Wayland desktop (`labwc` + XWayland for GParted + a tiny-skia fallback + `wayvnc` left disabled + the Iced management shell).
 - `sbm-cored` for read-only disk discovery, `DiskIdentity` matching, and `StorageOperationPlan` checks. SBM 0.1 does not execute partition changes.
+- `sbm_runtime::inspect_catalog_plan` compares an `OsInstallPlan` from `sbm-catalog` with the `OsCatalogEntry` it names. An unbound plan with an empty operation list can pass inspection and stays non-executable. A hash mismatch or a storage operation on the unbound disk is rejected. See [docs/CATALOG.md](docs/CATALOG.md).
 
 ## Canonical Documentation & Contracts
 

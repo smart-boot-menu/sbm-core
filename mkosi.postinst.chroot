@@ -11,5 +11,5 @@ fi
 chmod 755 /usr/lib/sbm/start-session /usr/lib/sbm/sbm-smoke.sh \
     /var/lib/sbm/.config/labwc/autostart 2>/dev/null || true
 if [ -n "${OUTPUTDIR:-}" ] && [ -d "$OUTPUTDIR" ]; then
-    cp /usr/share/sbm/package-licenses.tsv "$OUTPUTDIR/package-licenses.tsv" || true
+    cp /usr/share/sbm/package-licenses.tsv "$OUTPUTDIR/package-licenses-${ARCHITECTURE:-unknown}.tsv" || true
 fi

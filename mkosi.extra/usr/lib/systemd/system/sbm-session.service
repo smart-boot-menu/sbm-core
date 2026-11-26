@@ -2,7 +2,7 @@
 Description=SBM labwc session
 After=systemd-user-sessions.service sbm-cored.service
 Wants=sbm-cored.service
-Conflicts=getty@tty1.service
+Conflicts=getty@tty1.service display-manager.service
 After=getty@tty1.service
 
 [Service]

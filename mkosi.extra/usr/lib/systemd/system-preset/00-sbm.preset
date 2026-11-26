@@ -1,3 +1,5 @@
+disable gdm.service
+disable display-manager.service
 disable sshd.service
 disable sshd.socket
 disable systemd-networkd-wait-online.service

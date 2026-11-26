@@ -1,0 +1,13 @@
+[Unit]
+Description=SBM disposable-disk smoke checks
+ConditionPathExists=/efi/EFI/sbm/state/smoke
+After=sbm-session.service sbm-cored.service
+RequiresMountsFor=/efi
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/sbm/sbm-smoke.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+disable sshd.service
+disable sshd.socket
+disable systemd-networkd-wait-online.service
+enable systemd-networkd.service
+enable systemd-resolved.service
+enable iwd.service
+enable sbm-protect.service
+enable sbm-cored.service
+enable sbm-session.service
+enable sbm-smoke.service
+disable sbm-wayvnc.service

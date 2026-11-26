@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+mkdir -p /usr/share/sbm
+if command -v rpm >/dev/null 2>&1; then
+    rpm -qa --qf '%{NAME}\t%{EPOCH}:%{VERSION}-%{RELEASE}\t%{ARCH}\t%{LICENSE}\n' \
+        | sort >/usr/share/sbm/package-licenses.tsv
+fi
+if command -v fc-cache >/dev/null 2>&1; then
+    fc-cache -f || true
+fi
+chmod 755 /usr/lib/sbm/start-session /usr/lib/sbm/sbm-smoke.sh \
+    /var/lib/sbm/.config/labwc/autostart 2>/dev/null || true
+if [ -n "${OUTPUTDIR:-}" ] && [ -d "$OUTPUTDIR" ]; then
+    cp /usr/share/sbm/package-licenses.tsv "$OUTPUTDIR/package-licenses.tsv" || true
+fi

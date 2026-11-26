@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Copy the UKI onto the recovery path and record its digest.
+
+Runs on the build host after systemd-repart has written the disk image.
+"""
+
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ARCH_NAME = {"x86-64": "x86_64", "arm64": "aarch64"}
+BOOT_EFI = {"x86-64": "BOOTX64.EFI", "arm64": "BOOTAA64.EFI"}
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def find_esp(root: pathlib.Path) -> pathlib.Path | None:
+    candidates = [root, root / "efi", root / "boot", root / "boot/efi"]
+    for candidate in candidates:
+        if (candidate / "EFI" / "BOOT").is_dir() or (candidate / "efi" / "boot").is_dir():
+            return candidate
+    return None
+
+
+def mount(image: pathlib.Path, mountpoint: pathlib.Path) -> str:
+    dissected = subprocess.run(
+        ["systemd-dissect", "--mount", str(image), str(mountpoint)],
+        check=False,
+    )
+    if dissected.returncode == 0:
+        return "dissect"
+    loop = subprocess.run(
+        ["losetup", "--find", "--show", "--partscan", str(image)],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+    part = f"{loop}p1"
+    subprocess.run(["mount", part, str(mountpoint)], check=True)
+    return loop
+
+
+def unmount(mountpoint: pathlib.Path, how: str) -> None:
+    if how == "dissect":
+        subprocess.run(["systemd-dissect", "--umount", str(mountpoint)], check=False)
+        return
+    subprocess.run(["umount", str(mountpoint)], check=False)
+    if how.startswith("/dev/loop"):
+        subprocess.run(["losetup", "--detach", how], check=False)
+
+
+def main() -> int:
+    arch = os.environ["ARCHITECTURE"]
+    pretty = ARCH_NAME[arch]
+    output_dir = pathlib.Path(os.environ["OUTPUTDIR"])
+    raws = sorted(path for path in output_dir.glob("*.raw") if path.is_file())
+    if len(raws) != 1:
+        print(f"expected one raw image in {output_dir}, found {raws}", file=sys.stderr)
+        return 1
+    image = raws[0]
+    mountpoint = pathlib.Path(tempfile.mkdtemp(prefix="sbm-esp-"))
+    how = mount(image, mountpoint)
+    try:
+        esp = find_esp(mountpoint)
+        if esp is None:
+            print(f"ESP not found under {mountpoint}", file=sys.stderr)
+            for path in mountpoint.rglob("*"):
+                if path.is_file() and path.suffix.lower() == ".efi":
+                    print(path, file=sys.stderr)
+            return 1
+        boot = esp / "EFI" / "BOOT" / BOOT_EFI[arch]
+        if not boot.is_file():
+            found = list(esp.rglob("*.efi")) + list(esp.rglob("*.EFI"))
+            print(f"missing {boot}; efi files: {found}", file=sys.stderr)
+            return 1
+        slot = esp / "EFI" / "sbm" / "recovery" / "slot-a"
+        slot.mkdir(parents=True, exist_ok=True)
+        uki_name = f"sbm-core-{pretty}.efi"
+        uki = slot / uki_name
+        shutil.copy2(boot, uki)
+        digest = sha256_file(uki)
+        manifest = {
+            "schema_version": "1.0",
+            "active_slot": "slot-a",
+            "slots": [
+                {
+                    "slot_name": "slot-a",
+                    "uki_efi_path": f"\\EFI\\sbm\\recovery\\slot-a\\{uki_name}",
+                    "sha256": digest,
+                    "version": os.environ.get("IMAGE_VERSION", "0.1.0"),
+                    "healthy": True,
+                }
+            ],
+        }
+        manifest_path = esp / "EFI" / "sbm" / "recovery" / "manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        (esp / "EFI" / "sbm" / "state").mkdir(parents=True, exist_ok=True)
+    finally:
+        unmount(mountpoint, how)
+        mountpoint.rmdir()
+    subprocess.run(["sync"], check=False)
+    image_digest = sha256_file(image)
+    (output_dir / f"{image.name}.sha256").write_text(f"{image_digest}  {image.name}\n")
+    zst = pathlib.Path(str(image) + ".zst")
+    subprocess.run(
+        ["zstd", "-19", "-T0", "-f", str(image), "-o", str(zst)],
+        check=True,
+    )
+    (output_dir / f"{zst.name}.sha256").write_text(
+        f"{sha256_file(zst)}  {zst.name}\n"
+    )
+    print(f"uki sha256 {digest}")
+    print(f"raw {image.name} {image.stat().st_size} {image_digest}")
+    print(f"zst {zst.name} {zst.stat().st_size}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

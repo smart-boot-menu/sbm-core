@@ -8,3 +8,17 @@
 *.swo
 .vscode/
 .idea/
+
+# Image builds, the Linux builder VM, firmware keys, and mkosi caches.
+# Private keys must never be committed.
+/build/
+/mkosi.cache/
+/mkosi.packages/
+/mkosi.output/
+/mkosi.install/
+/mkosi.key
+/mkosi.crt
+/mkosi.crt.pem
+/.mkosi-*
+*.raw
+*.qcow2

@@ -1,0 +1,13 @@
+[package]
+name = "sbm-ui"
+description = "Iced management shell for SBM Core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+iced.workspace = true
+sbm-runtime = { path = "../sbm-runtime" }
+sbm-types.workspace = true

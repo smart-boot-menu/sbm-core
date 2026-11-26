@@ -1,0 +1,14 @@
+{
+  "name": "SBM",
+  "source": "local until sbm-common carries a theme",
+  "color": {
+    "background": "#121418",
+    "surface": "#1C212B",
+    "text": "#E7ECF3",
+    "muted": "#9AA3B2",
+    "accent": "#3D8BFD",
+    "ok": "#3DDC97",
+    "warning": "#E6B450",
+    "danger": "#E35D6A"
+  }
+}

@@ -1,0 +1,26 @@
+[package]
+name = "sbm-cored"
+description = "Privileged SBM Core daemon. The shell talks to it over a local socket and cannot pass shell commands."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sbm-protocol.workspace = true
+sbm-runtime = { path = "../sbm-runtime" }
+sbm-types.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "sbm-cored"
+path = "src/bin/sbm-cored.rs"
+
+[[bin]]
+name = "sbm-ctl"
+path = "src/bin/sbm-ctl.rs"
+
+[[bin]]
+name = "sbm-toram"
+path = "src/bin/sbm-toram.rs"

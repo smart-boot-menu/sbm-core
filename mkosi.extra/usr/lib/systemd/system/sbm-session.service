@@ -1,0 +1,26 @@
+[Unit]
+Description=SBM labwc session
+After=systemd-user-sessions.service sbm-cored.service
+Wants=sbm-cored.service
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
+[Service]
+User=sbm
+Group=sbm
+SupplementaryGroups=video render input
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+PAMName=sbm-session
+WorkingDirectory=/var/lib/sbm
+Environment=HOME=/var/lib/sbm
+Environment=USER=sbm
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/lib/sbm/start-session
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

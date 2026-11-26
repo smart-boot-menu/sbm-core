@@ -1,0 +1,16 @@
+[package]
+name = "sbm-runtime"
+description = "SBM Core policy: RAM-resident mode, read-only discovery parsing, handoff verification, and local IPC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sbm-protocol.workspace = true
+sbm-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true

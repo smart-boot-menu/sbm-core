@@ -1,0 +1,9 @@
+[Match]
+Name=en* eth* usb*
+
+[Network]
+DHCP=yes
+LinkLocalAddressing=ipv6
+
+[DHCP]
+RouteMetric=100

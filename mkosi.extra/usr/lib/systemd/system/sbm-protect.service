@@ -1,0 +1,14 @@
+[Unit]
+Description=Hold the backing disk read-only when the root is not in RAM
+DefaultDependencies=no
+After=local-fs.target
+Before=sbm-cored.service
+ConditionPathExists=/run/sbm/mode
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sbm-toram
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

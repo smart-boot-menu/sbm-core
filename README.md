@@ -2,16 +2,15 @@
 
 Independently bootable, immutable, modular, RAM-capable minimal Linux management & recovery environment built with `mkosi v27.1`.
 
-> **Project Status:** Phase 0 initialized — ready for dedicated engineering agent implementation targeting **SBM 0.1**.
+> **Project Status:** SBM 0.1 image configuration, daemon, and Iced shell. Compressed-size targets in ADR-003 are targets. Measured sizes are written down only after a build.
 
 ## Scope & Responsibilities
 
-- Unified `mkosi` build recipes producing signed Unified Kernel Images (UKIs) + `dm-verity`-verified EROFS (`zstd`) root filesystems:
-  - **x86-64 & Generic ARM64 PCs:** Fedora Minimal (~420–650 MiB compressed).
-  - **Apple Silicon:** the shared mkosi pipeline with the delta in [docs/apple-silicon-profile.md](docs/apple-silicon-profile.md). `kernel-16k` and the ~500–850 MiB figure are the historical target names, not a measured image.
-- Adaptive RAM mode (`sbm.toram=auto` on ≥ 4 GiB RAM; direct EROFS + `zram` overlay on 2 GiB older laptops).
-- Wayland desktop (`labwc` + XWayland for GTK3 GParted `1.8.1` + `llvmpipe` fallback + `wayvnc` remote desktop + native Rust `Iced` management UI).
-- Rust safety orchestrator (`sbm-cored`) for read-only disk discovery, `DiskIdentity` matching, `StorageOperationPlan` validation, verified OS installation (`bootc`, rootfs, `wimlib-imagex`, `kexec`), `partclone` backup/cloning, and hardware diagnostics.
+- Unified `mkosi` build recipes producing signed Unified Kernel Images (UKIs) + `dm-verity`-verified EROFS (`zstd`) root filesystems for generic x86-64 and ARM64 PCs on Fedora 45.
+- Apple Silicon uses the same pipeline with the delta in [docs/apple-silicon-profile.md](docs/apple-silicon-profile.md). That profile is not built: `kernel-16k` was absent from the Fedora 45 repositories queried on 2026-11-26.
+- Adaptive RAM mode when `MemTotal` is at least 3584 MiB and the image plus 1536 MiB of headroom fits. Smaller machines keep the root on the backing disk and protect that disk.
+- Wayland desktop (`labwc` + XWayland for GParted + a tiny-skia fallback + `wayvnc` left disabled + the Iced management shell).
+- `sbm-cored` for read-only disk discovery, `DiskIdentity` matching, and `StorageOperationPlan` checks. SBM 0.1 does not execute partition changes.
 
 ## Canonical Documentation & Contracts
 

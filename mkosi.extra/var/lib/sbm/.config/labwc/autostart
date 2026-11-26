@@ -1,0 +1,14 @@
+#!/bin/sh
+# Allow the root-owned GParted process to use this user's XWayland display.
+i=0
+while [ "$i" -lt 50 ]; do
+    if xhost +si:localuser:root >/dev/null 2>&1; then
+        break
+    fi
+    i=$((i + 1))
+    sleep 0.2
+done
+while true; do
+    sbm-ui || true
+    sleep 1
+done

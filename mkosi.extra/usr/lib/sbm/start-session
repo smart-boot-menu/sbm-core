@@ -1,0 +1,39 @@
+#!/bin/sh
+# Graphical session for the sbm user. labwc stays up if the shell exits.
+set -eu
+export HOME=/var/lib/sbm
+export USER=sbm
+export LOGNAME=sbm
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}"
+export XDG_SESSION_TYPE=wayland
+mkdir -p "$XDG_RUNTIME_DIR" /var/lib/sbm
+chmod 700 "$XDG_RUNTIME_DIR" || true
+
+software=0
+if grep -q 'sbm.renderer=software' /proc/cmdline 2>/dev/null; then
+    software=1
+fi
+if [ -f /efi/EFI/sbm/state/renderer ] && grep -q software /efi/EFI/sbm/state/renderer; then
+    software=1
+fi
+if [ "$software" -eq 1 ]; then
+    export WLR_RENDERER=pixman
+    export ICED_BACKEND=tiny-skia
+    export LIBGL_ALWAYS_SOFTWARE=1
+    export GALLIUM_DRIVER=llvmpipe
+    export WLR_RENDERER_ALLOW_SOFTWARE=1
+fi
+
+(
+    sleep 20
+    total=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || echo 0)
+    avail=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo 2>/dev/null || echo 0)
+    echo "<6>SBM_IDLE_MEM total_kib=${total} available_kib=${avail}" >/dev/kmsg || true
+) &
+
+echo "<6>SBM_DESKTOP_READY renderer=${WLR_RENDERER:-auto}" >/dev/kmsg || true
+set +e
+/usr/bin/labwc
+status=$?
+echo "<3>SBM_LABWC_EXIT status=${status}" >/dev/kmsg || true
+exit "$status"

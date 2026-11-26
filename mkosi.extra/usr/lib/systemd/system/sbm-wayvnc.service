@@ -1,0 +1,15 @@
+[Unit]
+Description=SBM authenticated remote desktop
+ConditionPathExists=/var/lib/sbm/remote.authorized
+After=sbm-session.service
+
+[Service]
+User=sbm
+Group=sbm
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=HOME=/var/lib/sbm
+ExecStart=/usr/bin/wayvnc --config /var/lib/sbm/wayvnc.cfg
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

@@ -82,6 +82,8 @@ cleanup_qemu() {
     fi
 }
 trap cleanup_qemu EXIT
+trap 'cleanup_qemu; exit 130' INT
+trap 'cleanup_qemu; exit 143' TERM
 
 if [ "$arch" = "arm64" ]; then
     "$qemu_aarch64" -name sbm-core-arm64 \

@@ -59,7 +59,7 @@ default_guest_cpus() {
 }
 
 qemu_system_lines() {
-    ps -axo pid=,command= 2>/dev/null | LC_ALL=C /usr/bin/grep -E 'qemu-system-' | LC_ALL=C /usr/bin/grep -v grep || true
+    ps -axww -o pid=,command= 2>/dev/null | LC_ALL=C /usr/bin/grep -E 'qemu-system-' | LC_ALL=C /usr/bin/grep -v grep || true
 }
 
 assert_no_other_qemu() {

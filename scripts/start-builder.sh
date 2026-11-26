@@ -19,7 +19,7 @@ qemu_pid() {
         fi
     fi
     # Match the QEMU executable, not this awk line, which also contains the name.
-    ps -axo pid=,comm=,args= | LC_ALL=C awk '$2 == "qemu-system-aarch64" && / -name sbm-builder/ { print $1; exit }'
+    ps -axww -o pid=,comm=,args= | LC_ALL=C awk '$2 == "qemu-system-aarch64" && / -name sbm-builder/ { print $1; exit }'
 }
 
 release_reservation() {

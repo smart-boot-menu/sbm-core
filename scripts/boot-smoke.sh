@@ -43,13 +43,17 @@ qemu_x86=/opt/homebrew/bin/qemu-system-x86_64
 fw=/opt/homebrew/share/qemu
 serial="$evidence/serial.log"
 qmp="$evidence/qmp.sock"
-rm -f "$serial" "$qmp" "$evidence/screen.ppm" "$evidence/screen-smoke.ppm"
+overlay="$evidence/disk-overlay.qcow2"
+rm -f "$serial" "$qmp" "$overlay" "$evidence/screen.ppm" "$evidence/screen-smoke.ppm"
 : >"$serial"
+
+# Attach a disposable QCOW2 overlay so smoke runs never mutate the raw image or its digest.
+/opt/homebrew/bin/qemu-img create -q -f qcow2 -F raw -b "$image" "$overlay"
 
 scratch_arg=()
 if [ "$scratch" -eq 1 ]; then
     scratch_disk="$evidence/scratch.qcow2"
-    /opt/homebrew/bin/qemu-img create -f qcow2 "$scratch_disk" 1G
+    /opt/homebrew/bin/qemu-img create -q -f qcow2 "$scratch_disk" 1G
     scratch_arg=(
         -drive "if=none,id=scratch,file=${scratch_disk},format=qcow2"
         -device virtio-blk-pci,drive=scratch
@@ -66,7 +70,7 @@ common=(
     -display none
     -qmp "unix:${qmp},server,nowait"
     -smbios type=1,manufacturer=SBM,product=SBM-Core-Lab,version=0.1.0
-    -drive "if=none,id=hd,file=${image},format=raw"
+    -drive "if=none,id=hd,file=${overlay},format=qcow2"
     -device virtio-blk-pci,drive=hd
 )
 
@@ -76,6 +80,7 @@ cleanup_qemu() {
         sleep 1
         kill -9 "$pid" 2>/dev/null || true
     fi
+    rm -f "$overlay"
     if [ -n "${hold:-}" ]; then
         sbm_release "$hold" || true
         hold=""

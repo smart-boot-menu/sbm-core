@@ -90,6 +90,9 @@ def main() -> int:
     arch = os.environ["ARCHITECTURE"]
     pretty = ARCH_NAME[arch]
     output_dir = pathlib.Path(os.environ["OUTPUTDIR"])
+    compress = os.environ.get("SBM_COMPRESS", "1") != "0" and "--no-compress" not in sys.argv[1:]
+    force_compress = os.environ.get("SBM_FORCE_COMPRESS", "0") == "1"
+
     raws = sorted(
         path
         for path in output_dir.glob("*.raw")
@@ -101,6 +104,13 @@ def main() -> int:
         print(f"expected one {arch} raw image in {output_dir}, found {raws}", file=sys.stderr)
         return 1
     image = raws[0]
+    raw_sha_path = output_dir / f"{image.name}.sha256"
+    prev_raw_digest = None
+    if raw_sha_path.is_file():
+        parts = raw_sha_path.read_text().split()
+        if parts:
+            prev_raw_digest = parts[0]
+
     mountpoint = pathlib.Path(tempfile.mkdtemp(prefix="sbm-esp-"))
     how = mount(image, mountpoint)
     try:
@@ -155,16 +165,31 @@ def main() -> int:
         mountpoint.rmdir()
     subprocess.run(["sync"], check=False)
     image_digest = sha256_file(image)
-    (output_dir / f"{image.name}.sha256").write_text(f"{image_digest}  {image.name}\n")
+    raw_sha_path.write_text(f"{image_digest}  {image.name}\n")
+    print(f"uki sha256 {digest}")
+    print(f"raw {image.name} {image.stat().st_size} {image_digest}")
+
     zst = pathlib.Path(str(image) + ".zst")
+    zst_sha_path = output_dir / f"{zst.name}.sha256"
+    if not compress:
+        # Remove any stale compressed image so callers never pair an old .zst
+        # with a newly built .raw image.
+        for stale in (zst, zst_sha_path):
+            if stale.exists():
+                stale.unlink()
+        print("zst skipped (SBM_COMPRESS=0)")
+        return 0
+
+    if not force_compress and prev_raw_digest == image_digest and zst.is_file() and zst_sha_path.is_file():
+        print(f"zst reused {zst.name} {zst.stat().st_size} (raw sha256 unchanged)")
+        return 0
+
     # One thread. Level 19 with every core can exhaust an 8 GiB builder.
     subprocess.run(
         ["zstd", "-19", "-T1", "-f", str(image), "-o", str(zst)],
         check=True,
     )
-    (output_dir / f"{zst.name}.sha256").write_text(f"{sha256_file(zst)}  {zst.name}\n")
-    print(f"uki sha256 {digest}")
-    print(f"raw {image.name} {image.stat().st_size} {image_digest}")
+    zst_sha_path.write_text(f"{sha256_file(zst)}  {zst.name}\n")
     print(f"zst {zst.name} {zst.stat().st_size}")
     return 0
 

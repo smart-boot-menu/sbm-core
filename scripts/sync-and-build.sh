@@ -1,5 +1,8 @@
 #!/bin/bash
 # Copy this repo and sbm-common into the builder VM and start the image build.
+# Forwarded environment variables:
+#   SBM_BUILD_PROFILE, SBM_ARCHES, SBM_INCREMENTAL, SBM_COMPRESS,
+#   SBM_FORCE_COMPRESS, CARGO_BUILD_JOBS
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 "${root}/scripts/start-builder.sh" start
@@ -17,4 +20,12 @@ rsync=(rsync -a --delete -e "ssh -i ${key} -p 2222 -o StrictHostKeyChecking=no -
     --exclude target --exclude .git \
     "${root}/../sbm-common/" builder@127.0.0.1:/home/builder/src/sbm-common/
 
-"${ssh[@]}" builder@127.0.0.1 'chmod +x /home/builder/src/sbm-core/scripts/build-inside.sh && cd /home/builder/src/sbm-core && setsid /home/builder/src/sbm-core/scripts/build-inside.sh > /home/builder/image-build.log 2>&1 < /dev/null & echo STARTED $!'
+remote_env=""
+for var in SBM_BUILD_PROFILE SBM_ARCHES SBM_INCREMENTAL SBM_COMPRESS SBM_FORCE_COMPRESS CARGO_BUILD_JOBS; do
+    if [ -n "${!var:-}" ]; then
+        remote_env="${remote_env} ${var}=$(printf '%q' "${!var}")"
+    fi
+done
+
+"${ssh[@]}" builder@127.0.0.1 \
+    "chmod +x /home/builder/src/sbm-core/scripts/build-inside.sh && cd /home/builder/src/sbm-core && setsid env${remote_env} /home/builder/src/sbm-core/scripts/build-inside.sh > /home/builder/image-build.log 2>&1 < /dev/null & echo STARTED \$!"

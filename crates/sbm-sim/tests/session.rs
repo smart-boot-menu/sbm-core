@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use sbm_protocol::{BootCommand, BootSuccessReport};
+use sbm_protocol::{BootCommand, BootSuccessReport, LocalBootRequest, is_uuid_v4};
 use sbm_runtime::ipc::{ClientRequest, ClientResponse, LaunchTool, PowerAction};
 use sbm_sim::{COMMAND_PATH, POWER_PATH, PowerOutcome, SUCCESS_PATH, Session};
 use sbm_types::{OsFamily, PartitionProtectionClass, SbmErrorCode};
@@ -29,7 +29,7 @@ fn session(name: &str) -> (Session, PathBuf) {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "sbm-sim-test-{}-{}-{name}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
@@ -41,7 +41,8 @@ fn session(name: &str) -> (Session, PathBuf) {
 
 #[test]
 fn refuses_directories_without_the_simulated_marker() {
-    let dir = std::env::temp_dir().join(format!("sbm-sim-test-{}-bare", std::process::id()));
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("sbm-sim-test-{}-bare", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     assert!(Session::open(&dir).is_err());
 }
@@ -148,12 +149,17 @@ fn boot_target_writes_a_one_shot_command_and_reboots() {
     });
     assert!(matches!(response, ClientResponse::Ack { .. }));
     assert_eq!(outcome, Some(PowerOutcome::Reboot));
-    let command: BootCommand =
+    let request: LocalBootRequest =
         serde_json::from_slice(&fs::read(dir.join(COMMAND_PATH)).unwrap()).unwrap();
     assert!(matches!(
-        command,
+        request.command,
         BootCommand::BootTarget { ref target_id, one_shot: true, .. } if *target_id == windows.id
     ));
+    assert!(is_uuid_v4(&request.request_id));
+    assert_eq!(
+        request.attempt_id,
+        session.handoff().payload.unwrap().attempt_id
+    );
     assert_eq!(fs::read_to_string(dir.join(POWER_PATH)).unwrap(), "reboot");
 }
 

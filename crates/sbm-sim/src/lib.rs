@@ -14,9 +14,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sbm_protocol::{BootCommand, BootSuccessReport};
+use sbm_protocol::BootSuccessReport;
 use sbm_runtime::discover::{backing_disk, infer_installed_os, parse_lsblk};
-use sbm_runtime::handoff::{HandoffContext, cmdline_value, verify_handoff};
+use sbm_runtime::handoff::{
+    EspCandidate, load_handoff, read_integrated, select_integrated_esp, write_esp_record,
+};
 use sbm_runtime::hostinfo::{parse_ip_addr, parse_meminfo};
 use sbm_runtime::ipc::{
     ClientRequest, ClientResponse, HardwareInfo, LaunchTool, PowerAction, SystemSnapshot,
@@ -112,19 +114,50 @@ impl Session {
     }
 
     pub fn handoff(&self) -> HandoffLoad {
-        let cmdline = self.read("cmdline").unwrap_or_default();
-        let ctx = HandoffContext {
-            expected_sha256: cmdline_value(&cmdline, "sbm.handoff_sha256"),
-            expected_attempt_id: None,
-            expected_version: None,
-            expected_arch: match self.hardware().arch.as_str() {
-                "x86_64" => Some(CpuArch::X86_64),
-                "aarch64" => Some(CpuArch::Aarch64),
-                _ => None,
-            },
+        let arch = match self.hardware().arch.as_str() {
+            "x86_64" => Some(CpuArch::X86_64),
+            "aarch64" => Some(CpuArch::Aarch64),
+            _ => None,
         };
-        let bytes = fs::read(self.dir.join(HANDOFF_PATH)).ok();
-        let mut load = verify_handoff(bytes.as_deref(), &ctx);
+        let mut load = read_integrated(
+            |name| fs::read(self.dir.join("efivars").join(name)).ok(),
+            arch,
+            |partuuid| {
+                let source = self
+                    .line("root-source")
+                    .ok_or("simulated backing device is missing")?;
+                let lsblk = self
+                    .read("lsblk.json")
+                    .ok_or("simulated disk inventory is missing")?;
+                let disks = parse_lsblk(&lsblk, Some(&source)).map_err(|err| err.to_string())?;
+                let backing = backing_disk(&disks, &source);
+                let candidates = disks
+                    .iter()
+                    .flat_map(|disk| {
+                        disk.partitions.iter().map(|part| EspCandidate {
+                            path: part.device_path.clone(),
+                            partuuid: part.partuuid.clone(),
+                            parttype: part.parttype.clone(),
+                            fstype: part.fstype.clone(),
+                            parent_disk: Some(disk.device_path.clone()),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                select_integrated_esp(
+                    &candidates,
+                    partuuid,
+                    backing.map(|disk| disk.device_path.as_str()),
+                )?;
+                fs::read(self.dir.join(HANDOFF_PATH)).map_err(|err| err.to_string())
+            },
+        );
+        if !load.verified
+            && !self.dir.join("efivars").exists()
+            && let Some(cmdline) = self.read("cmdline")
+        {
+            let bytes = fs::read(self.dir.join(HANDOFF_PATH)).ok();
+            load = load_handoff(bytes.as_deref(), &cmdline);
+        }
         load.detail = format!("{} [SIMULATED]", load.detail);
         load
     }
@@ -192,6 +225,7 @@ impl Session {
         }
         snap.tools = simulated_tools();
         let handoff = self.handoff();
+        snap.boot_targets = handoff.boot_targets();
         snap.handoff = handoff.detail;
         snap.handoff_verified = handoff.verified;
         snap.renderer = "SIMULATED: native desktop window".into();
@@ -256,21 +290,19 @@ impl Session {
         let Some(payload) = handoff.payload.as_ref().filter(|_| handoff.verified) else {
             return "SIMULATED: desktop ready (handoff unverified; no confirmation written)".into();
         };
-        let target_id = self
-            .line("loader-entry-selected")
-            .filter(|id| BootTargetId(id.clone()).is_valid())
-            .unwrap_or_else(|| SLOT_A_TARGET_ID.to_string());
         let report = BootSuccessReport {
             schema_version: SCHEMA_VERSION_V1.to_string(),
             attempt_id: payload.attempt_id.clone(),
-            target_id: BootTargetId(target_id),
+            target_id: BootTargetId(SLOT_A_TARGET_ID.into()),
             confirmed_by: ComponentKind::SbmCoreUki,
             confirmed_at_unix: unix_now(),
         };
         match serde_json::to_vec_pretty(&report)
             .map_err(|err| err.to_string())
-            .and_then(|bytes| self.write(SUCCESS_PATH, &bytes))
-        {
+            .and_then(|bytes| {
+                write_esp_record(&self.dir.join(SUCCESS_PATH), &bytes)
+                    .map_err(|err| err.to_string())
+            }) {
             Ok(()) => format!(
                 "SIMULATED: desktop ready (confirmed {})",
                 payload.attempt_id
@@ -288,33 +320,19 @@ impl Session {
                 PowerOutcome::Reboot,
             ),
             PowerAction::BootTarget { target_id } => {
-                let id = BootTargetId(target_id);
-                if !id.is_valid() {
-                    return (
-                        error(
-                            "target id is not a stable SBM identifier",
-                            SbmErrorCode::InvalidSchema,
-                        ),
-                        None,
-                    );
-                }
-                if !self.known_target(id.as_str()) {
-                    return (
-                        error(
-                            "that boot target was not discovered",
-                            SbmErrorCode::TargetNotFound,
-                        ),
-                        None,
-                    );
-                }
-                let command = BootCommand::BootTarget {
-                    target_id: id,
-                    one_shot: true,
-                    extra_cmdline_preset: None,
+                let command = match self
+                    .handoff()
+                    .boot_request(BootTargetId(target_id), unix_now())
+                {
+                    Ok(command) => command,
+                    Err((message, code)) => return (error(message, code), None),
                 };
-                if let Err(err) = serde_json::to_vec_pretty(&command)
+                if let Err(err) = serde_json::to_vec(&command)
                     .map_err(|err| err.to_string())
-                    .and_then(|bytes| self.write(COMMAND_PATH, &bytes))
+                    .and_then(|bytes| {
+                        write_esp_record(&self.dir.join(COMMAND_PATH), &bytes)
+                            .map_err(|err| err.to_string())
+                    })
                 {
                     return (error(err, SbmErrorCode::StorageIoError), None);
                 }
@@ -328,20 +346,6 @@ impl Session {
             return (error(err, SbmErrorCode::StorageIoError), None);
         }
         (ack(message), Some(outcome))
-    }
-
-    fn known_target(&self, id: &str) -> bool {
-        if id == SLOT_A_TARGET_ID {
-            return true;
-        }
-        if self.snapshot().installed_os.iter().any(|os| os.id == id) {
-            return true;
-        }
-        self.handoff()
-            .payload
-            .into_iter()
-            .flat_map(|payload| payload.discovered_targets)
-            .any(|target| target.id.as_str() == id)
     }
 
     fn write(&self, relative: &str, bytes: &[u8]) -> Result<(), String> {

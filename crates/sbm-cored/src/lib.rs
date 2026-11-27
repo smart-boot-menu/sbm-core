@@ -15,11 +15,11 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use sbm_protocol::{BootCommand, BootSuccessReport};
+use sbm_protocol::BootSuccessReport;
 use sbm_runtime::discover::{backing_disk, infer_installed_os, parse_lsblk};
 use sbm_runtime::handoff::{
-    EspCandidate, HandoffContext, cmdline_value, decode_efivar_utf16, native_cpu_arch,
-    select_boot_esp, verify_handoff,
+    BOOT_ESP_VARIABLE, EspCandidate, cmdline_value, decode_efivar_utf16, load_handoff,
+    native_cpu_arch, read_integrated, select_integrated_esp, write_esp_record,
 };
 use sbm_runtime::hostinfo::{
     cpu_count, cpu_model, gpu_label, parse_ip_addr, parse_meminfo, parse_uptime,
@@ -33,8 +33,6 @@ use sbm_runtime::plan::validate_plan;
 use sbm_runtime::{HandoffLoad, SBM_VERSION, SLOT_A_TARGET_ID};
 use sbm_types::{BootTargetId, ComponentKind, SCHEMA_VERSION_V1, SbmErrorCode};
 
-const SYSTEMD_VENDOR_GUID: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
-const SBM_VENDOR_GUID: &str = "d8f4a21c-7b6e-4c91-9e32-8a5c1f0e3b40";
 const BOOT_EFI_MOUNT: &str = "/run/sbm/boot-efi";
 
 enum AfterAction {
@@ -188,7 +186,7 @@ fn handle(request: ClientRequest) -> Handled {
             after: AfterAction::None,
         },
         ClientRequest::UiReady => {
-            let handoff = read_handoff();
+            let (handoff, mount) = read_handoff();
             let root_source = read_line("/run/sbm/root-source").unwrap_or_else(|| "unknown".into());
             let esp_path = resolve_boot_esp_candidate()
                 .map(|c| c.path)
@@ -197,7 +195,7 @@ fn handle(request: ClientRequest) -> Handled {
                 "SBM_UI_READY handoff_verified={} esp={} root_source={}",
                 handoff.verified, esp_path, root_source
             ));
-            match write_boot_success(&handoff) {
+            match write_boot_success(&handoff, mount.as_deref()) {
                 Ok(Some((attempt_id, target_id))) => {
                     kmsg(&format!(
                         "SBM_BOOT_SUCCESS_WRITTEN attempt_id={attempt_id} target_id={target_id}"
@@ -314,7 +312,8 @@ fn snapshot() -> SystemSnapshot {
         snap.nics = nics;
     }
     snap.tools = tool_presence();
-    let handoff = read_handoff();
+    let (handoff, _) = read_handoff();
+    snap.boot_targets = handoff.boot_targets();
     snap.handoff = handoff.detail;
     snap.handoff_verified = handoff.verified;
     snap.renderer = active_renderer();
@@ -333,7 +332,8 @@ fn active_renderer() -> String {
     }
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let forced = cmdline_value(&cmdline, "sbm.renderer").or_else(|| {
-        boot_efi_mount()
+        resolve_boot_esp_candidate()
+            .and_then(|esp| boot_efi_mount(&esp))
             .ok()
             .and_then(|root| read_line(&root.join("EFI/sbm/state/renderer").to_string_lossy()))
     });
@@ -370,30 +370,25 @@ fn power(action: PowerAction) -> Handled {
             }
         }
         PowerAction::BootTarget { target_id } => {
-            let id = BootTargetId(target_id);
-            if !id.is_valid() {
-                return error(
-                    "target id is not a stable SBM identifier".to_string(),
-                    Some(SbmErrorCode::InvalidSchema),
-                );
-            }
-            if !known_target(id.as_str()) {
-                return error(
-                    "that boot target was not discovered".to_string(),
-                    Some(SbmErrorCode::TargetNotFound),
-                );
-            }
-            let command = BootCommand::BootTarget {
-                target_id: id,
-                one_shot: true,
-                extra_cmdline_preset: None,
+            let (handoff, mount) = read_handoff();
+            let command = match handoff.boot_request(BootTargetId(target_id), unix_now()) {
+                Ok(command) => command,
+                Err((message, code)) => return error(message, Some(code)),
             };
-            let bytes = match serde_json::to_vec_pretty(&command) {
+            let Some(root) = mount else {
+                return error(
+                    "boot ESP is unavailable",
+                    Some(SbmErrorCode::StorageIoError),
+                );
+            };
+            let bytes = match serde_json::to_vec(&command) {
                 Ok(bytes) => bytes,
                 Err(err) => return error(err.to_string(), Some(SbmErrorCode::InvalidSchema)),
             };
-            if let Err(err) = write_esp("EFI/sbm/handoff/requested-command.json", &bytes) {
-                return error(err, Some(SbmErrorCode::StorageIoError));
+            if let Err(err) =
+                write_esp_record(&root.join("EFI/sbm/handoff/requested-command.json"), &bytes)
+            {
+                return error(err.to_string(), Some(SbmErrorCode::StorageIoError));
             }
             kmsg("SBM_POWER_ACTION action=boot-target");
             Handled {
@@ -404,21 +399,6 @@ fn power(action: PowerAction) -> Handled {
             }
         }
     }
-}
-
-fn known_target(id: &str) -> bool {
-    if id == SLOT_A_TARGET_ID {
-        return true;
-    }
-    let snap = snapshot();
-    if snap.installed_os.iter().any(|os| os.id == id) {
-        return true;
-    }
-    read_handoff()
-        .payload
-        .into_iter()
-        .flat_map(|payload| payload.discovered_targets)
-        .any(|target| target.id.as_str() == id)
 }
 
 fn authorize_xwayland_root(display: &str, wayland: &str, xauthority: Option<&str>) {
@@ -638,10 +618,8 @@ fn remote_enabled() -> bool {
     Path::new("/var/lib/sbm/remote.authorized").exists()
 }
 
-fn read_efivar(name: &str, guid: &str) -> Option<String> {
-    let path = format!("/sys/firmware/efi/efivars/{name}-{guid}");
-    let bytes = fs::read(path).ok()?;
-    decode_efivar_utf16(&bytes)
+fn read_efivar(name: &str) -> Option<Vec<u8>> {
+    fs::read(format!("/sys/firmware/efi/efivars/{name}")).ok()
 }
 
 fn current_backing_disk() -> Option<String> {
@@ -650,9 +628,13 @@ fn current_backing_disk() -> Option<String> {
 }
 
 fn resolve_boot_esp_candidate() -> Result<EspCandidate, String> {
-    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    let expected_partuuid = read_efivar("LoaderDevicePartUUID", SYSTEMD_VENDOR_GUID)
-        .or_else(|| cmdline_value(&cmdline, "sbm.esp_partuuid"));
+    let expected = read_efivar(BOOT_ESP_VARIABLE)
+        .and_then(|bytes| decode_efivar_utf16(&bytes))
+        .ok_or("boot ESP EFI variable is missing")?;
+    resolve_esp(&expected)
+}
+
+fn resolve_esp(expected: &str) -> Result<EspCandidate, String> {
     let backing = current_backing_disk();
 
     let json = command_stdout(
@@ -708,25 +690,22 @@ fn resolve_boot_esp_candidate() -> Result<EspCandidate, String> {
             });
         }
     }
-    select_boot_esp(
-        &candidates,
-        expected_partuuid.as_deref(),
-        backing.as_deref(),
-    )
+    select_integrated_esp(&candidates, expected, backing.as_deref())
 }
 
-fn boot_efi_mount() -> Result<PathBuf, String> {
-    let esp = resolve_boot_esp_candidate()?;
+fn boot_efi_mount(esp: &EspCandidate) -> Result<PathBuf, String> {
     set_ro(&esp.path, false);
     let mounts = mount_table();
-    for (device, point, opts) in &mounts {
-        if same_block_device(device, &esp.path)
-            && (point == "/efi" || point == BOOT_EFI_MOUNT || point == "/boot")
-        {
+    for point in ["/efi", BOOT_EFI_MOUNT, "/boot"] {
+        if let Some((_, _, opts)) = verified_esp_mount(&mounts, point, &esp.path) {
             if opts.split(',').any(|o| o == "ro") {
-                let _ = Command::new("mount")
+                let status = Command::new("mount")
                     .args(["-o", "remount,rw", point])
-                    .status();
+                    .status()
+                    .map_err(|err| err.to_string())?;
+                if !status.success() {
+                    return Err(format!("failed to remount the boot ESP at {point}"));
+                }
             }
             return Ok(PathBuf::from(point));
         }
@@ -737,6 +716,12 @@ fn boot_efi_mount() -> Result<PathBuf, String> {
     } else {
         PathBuf::from("/efi")
     };
+    if mounts
+        .iter()
+        .any(|(_, point, _)| Path::new(point) == target)
+    {
+        return Err("boot ESP mount point is occupied".into());
+    }
     fs::create_dir_all(&target).map_err(|err| err.to_string())?;
     let status = Command::new("mount")
         .args(["-t", "vfat", "-o", "rw", &esp.path])
@@ -753,6 +738,16 @@ fn boot_efi_mount() -> Result<PathBuf, String> {
     Ok(target)
 }
 
+fn verified_esp_mount<'a>(
+    mounts: &'a [(String, String, String)],
+    mountpoint: &str,
+    esp_device: &str,
+) -> Option<&'a (String, String, String)> {
+    let mut matching = mounts.iter().filter(|(_, point, _)| point == mountpoint);
+    let entry = matching.next()?;
+    (matching.next().is_none() && same_block_device(&entry.0, esp_device)).then_some(entry)
+}
+
 fn same_block_device(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -763,76 +758,55 @@ fn same_block_device(a: &str, b: &str) -> bool {
     }
 }
 
-fn read_handoff() -> HandoffLoad {
-    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    let expected_sha256 = read_efivar("SbmHandoffSha256", SBM_VENDOR_GUID)
-        .or_else(|| cmdline_value(&cmdline, "sbm.handoff_sha256"));
-    let expected_attempt_id = read_efivar("SbmBootAttemptId", SBM_VENDOR_GUID);
-    let expected_version = read_efivar("SbmHandoffVersion", SBM_VENDOR_GUID);
-    let ctx = HandoffContext {
-        expected_sha256,
-        expected_attempt_id,
-        expected_version,
-        expected_arch: native_cpu_arch(),
-    };
-    let root = match boot_efi_mount() {
-        Ok(root) => root,
-        Err(err) => {
-            return HandoffLoad {
-                payload: None,
-                verified: false,
-                detail: format!("boot ESP unresolved: {err}"),
-            };
+fn read_handoff() -> (HandoffLoad, Option<PathBuf>) {
+    let mut mount = None;
+    let mut load = read_integrated(read_efivar, native_cpu_arch(), |partuuid| {
+        let esp = resolve_esp(partuuid)?;
+        let root = boot_efi_mount(&esp)?;
+        let bytes = fs::read(root.join("EFI/sbm/handoff/current.json"))
+            .map_err(|err| format!("could not read the EFI handoff: {err}"))?;
+        mount = Some(root);
+        Ok(bytes)
+    });
+    if !load.verified && read_efivar(BOOT_ESP_VARIABLE).is_none() {
+        let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+        if let Some(uuid) = cmdline_value(&cmdline, "sbm.esp_partuuid")
+            && let Ok(esp) = resolve_esp(&uuid)
+        {
+            // Legacy diagnostics may read an existing, identity-checked mount.
+            let mounts = mount_table();
+            if let Some((_, point, _)) = ["/efi", "/boot", BOOT_EFI_MOUNT]
+                .into_iter()
+                .find_map(|point| verified_esp_mount(&mounts, point, &esp.path))
+            {
+                let bytes = fs::read(Path::new(&point).join("EFI/sbm/handoff/current.json")).ok();
+                load = load_handoff(bytes.as_deref(), &cmdline);
+            }
         }
-    };
-    let path = root.join("EFI/sbm/handoff/current.json");
-    let bytes = fs::read(&path).ok();
-    verify_handoff(bytes.as_deref(), &ctx)
+    }
+    (load, mount)
 }
 
-fn write_boot_success(handoff: &HandoffLoad) -> Result<Option<(String, String)>, String> {
-    if !handoff.verified {
-        return Ok(None);
-    }
-    let Some(payload) = handoff.payload.as_ref() else {
+fn write_boot_success(
+    handoff: &HandoffLoad,
+    root: Option<&Path>,
+) -> Result<Option<(String, String)>, String> {
+    let (Some(payload), Some(root)) = (handoff.payload.as_ref().filter(|_| handoff.verified), root)
+    else {
         return Ok(None);
     };
-    let target_id = read_efivar("LoaderEntrySelected", SYSTEMD_VENDOR_GUID)
-        .or_else(|| read_efivar("LoaderEntrySelected", SBM_VENDOR_GUID))
-        .filter(|id| BootTargetId(id.clone()).is_valid())
-        .unwrap_or_else(|| SLOT_A_TARGET_ID.to_string());
+    let target_id = SLOT_A_TARGET_ID.to_string();
     let report = BootSuccessReport {
-        schema_version: SCHEMA_VERSION_V1.to_string(),
+        schema_version: SCHEMA_VERSION_V1.into(),
         attempt_id: payload.attempt_id.clone(),
         target_id: BootTargetId(target_id.clone()),
         confirmed_by: ComponentKind::SbmCoreUki,
         confirmed_at_unix: unix_now(),
     };
-    let bytes = serde_json::to_vec_pretty(&report).map_err(|err| err.to_string())?;
-    write_esp("EFI/sbm/state/boot-success.json", &bytes)?;
+    let bytes = serde_json::to_vec(&report).map_err(|err| err.to_string())?;
+    write_esp_record(&root.join("EFI/sbm/state/boot-success.json"), &bytes)
+        .map_err(|err| err.to_string())?;
     Ok(Some((payload.attempt_id.clone(), target_id)))
-}
-
-fn write_esp(relative: &str, bytes: &[u8]) -> Result<(), String> {
-    let root = boot_efi_mount()?;
-    let path = root.join(relative);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file = File::create(&tmp).map_err(|err| err.to_string())?;
-        file.write_all(bytes).map_err(|err| err.to_string())?;
-        file.sync_all().map_err(|err| err.to_string())?;
-    }
-    fs::rename(&tmp, &path).map_err(|err| err.to_string())?;
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
-    let _ = Command::new("/usr/bin/sync").status();
-    Ok(())
 }
 
 fn annotate_health(disks: &mut [sbm_runtime::DiscoveredDisk]) {

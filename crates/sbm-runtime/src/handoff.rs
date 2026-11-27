@@ -1,15 +1,19 @@
 //! EFI handoff file and boot ESP selection from Spec 03.
 //!
-//! `\EFI\sbm\handoff\current.json` is parsed with `sbm-protocol`. Handoff
-//! metadata comes from volatile EFI variables (`LoaderDevicePartUUID`,
-//! `SbmHandoffVersion`, `SbmBootAttemptId`, `SbmHandoffSha256`) or legacy
-//! kernel command-line parameters (`sbm.esp_partuuid`, `sbm.handoff_sha256`).
-//! When a digest is supplied, the exact bytes must match or the payload is
-//! rejected. Without a verified handoff, Core records a local diagnostic and
-//! does not emit an integrated boot-success report.
+//! Integrated boot requires all five Spec 03 EFI variables. Legacy
+//! command-line handoffs are available for standalone diagnostics.
 
-use sbm_protocol::{EfiHandoffPayload, RecoveryLaunchMode};
-use sbm_types::{CpuArch, SCHEMA_VERSION_V1};
+use std::io::Read;
+use std::path::Path;
+
+use sbm_protocol::{
+    BootCommand, EfiHandoffPayload, LocalBootRequest, RecoveryLaunchMode, format_uuid_v4,
+    is_uuid_v4,
+};
+use sbm_types::{
+    BootTarget, BootTargetId, BootTargetKind, ComponentKind, CpuArch, SCHEMA_VERSION_V1,
+    SbmErrorCode,
+};
 
 use crate::sha256_hex;
 
@@ -23,7 +27,7 @@ pub struct HandoffLoad {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HandoffContext {
+struct HandoffContext {
     pub expected_sha256: Option<String>,
     pub expected_attempt_id: Option<String>,
     pub expected_version: Option<String>,
@@ -37,6 +41,167 @@ pub struct EspCandidate {
     pub parttype: Option<String>,
     pub fstype: Option<String>,
     pub parent_disk: Option<String>,
+}
+
+const SYSTEMD_VENDOR_GUID: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
+const SBM_VENDOR_GUID: &str = "d8f4a21c-7b6e-4c91-9e32-8a5c1f0e3b40";
+pub const BOOT_ESP_VARIABLE: &str = "LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
+
+pub fn read_integrated(
+    read_var: impl Fn(&str) -> Option<Vec<u8>>,
+    expected_arch: Option<CpuArch>,
+    read_file: impl FnOnce(&str) -> Result<Vec<u8>, String>,
+) -> HandoffLoad {
+    fn read(read_var: &impl Fn(&str) -> Option<Vec<u8>>, name: &str) -> Result<String, String> {
+        read_var(name)
+            .and_then(|bytes| decode_efivar_utf16(&bytes))
+            .ok_or_else(|| format!("missing or invalid EFI variable {name}"))
+    }
+
+    let load = || -> Result<HandoffLoad, String> {
+        let partuuid = read(&read_var, BOOT_ESP_VARIABLE)?;
+        if !is_partuuid(&partuuid) {
+            return Err("invalid boot ESP PARTUUID".into());
+        }
+        let selection = read(
+            &read_var,
+            &format!("LoaderEntrySelected-{SYSTEMD_VENDOR_GUID}"),
+        )?;
+        if selection != crate::SLOT_A_TARGET_ID {
+            return Err("EFI selection does not name the Slot A recovery UKI".into());
+        }
+        let version = read(&read_var, &format!("SbmHandoffVersion-{SBM_VENDOR_GUID}"))?;
+        let attempt = read(&read_var, &format!("SbmBootAttemptId-{SBM_VENDOR_GUID}"))?;
+        let digest = read(&read_var, &format!("SbmHandoffSha256-{SBM_VENDOR_GUID}"))?;
+        if version != SCHEMA_VERSION_V1 || !is_uuid_v4(&attempt) {
+            return Err("unsupported handoff version or invalid boot attempt ID".into());
+        }
+        if !lower_hex(&digest, 64) {
+            return Err("invalid handoff SHA-256 variable".into());
+        }
+        let arch = expected_arch.ok_or("unknown native architecture")?;
+        let bytes = read_file(&partuuid)?;
+        let mut result = verify_handoff(
+            Some(&bytes),
+            &HandoffContext {
+                expected_sha256: Some(digest),
+                expected_attempt_id: Some(attempt),
+                expected_version: Some(version),
+                expected_arch: Some(arch),
+            },
+        );
+        if result.verified {
+            result.detail = format!("{} [integrated EFI handoff]", result.detail);
+        }
+        Ok(result)
+    };
+    load().unwrap_or_else(|detail| HandoffLoad {
+        payload: None,
+        verified: false,
+        detail,
+    })
+}
+
+fn lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_partuuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+impl HandoffLoad {
+    pub fn boot_targets(&self) -> Vec<BootTarget> {
+        let Some(payload) = self.payload.as_ref().filter(|_| self.verified) else {
+            return Vec::new();
+        };
+        let targets = &payload.discovered_targets;
+        targets
+            .iter()
+            .filter(|target| {
+                target.id.is_valid()
+                    && !target.hidden
+                    && target.verified_signature != Some(false)
+                    && target.kind != BootTargetKind::SbmCore
+                    && !target.id.as_str().starts_with("os:")
+                    && !target.id.as_str().starts_with("sbm-core:")
+                    && targets.iter().filter(|other| other.id == target.id).count() == 1
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn boot_request(
+        &self,
+        target_id: BootTargetId,
+        now: i64,
+    ) -> Result<LocalBootRequest, (String, SbmErrorCode)> {
+        if !target_id.is_valid() {
+            return Err((
+                "target id is not a stable SBM boot identifier".into(),
+                SbmErrorCode::InvalidSchema,
+            ));
+        }
+        if !self
+            .boot_targets()
+            .iter()
+            .any(|target| target.id == target_id)
+        {
+            return Err((
+                "that target is unavailable in the integrated handoff".into(),
+                SbmErrorCode::TargetNotFound,
+            ));
+        }
+        let payload = self
+            .payload
+            .as_ref()
+            .ok_or_else(|| ("no integrated handoff".into(), SbmErrorCode::TargetNotFound))?;
+        let mut seed = [0; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut seed))
+            .map_err(|err| {
+                (
+                    format!("could not generate a boot request ID: {err}"),
+                    SbmErrorCode::StorageIoError,
+                )
+            })?;
+        Ok(LocalBootRequest {
+            schema_version: SCHEMA_VERSION_V1.into(),
+            request_id: format_uuid_v4(seed),
+            attempt_id: payload.attempt_id.clone(),
+            requested_by: ComponentKind::SbmCoreUki,
+            requested_at_unix: now,
+            command: BootCommand::BootTarget {
+                target_id,
+                one_shot: true,
+                extra_cmdline_preset: None,
+            },
+        })
+    }
+}
+
+pub fn write_esp_record(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = path.with_extension("json.tmp");
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(parent)?.sync_all()
 }
 
 pub fn launch_mode_label(mode: &RecoveryLaunchMode) -> &'static str {
@@ -61,25 +226,23 @@ pub fn native_cpu_arch() -> Option<CpuArch> {
 /// stripping the 4-byte UEFI variable attribute header and NUL-terminated
 /// UTF-16LE payload.
 pub fn decode_efivar_utf16(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 6 {
+    if bytes.len() < 6 || bytes[..4] != [6, 0, 0, 0] || !bytes.len().is_multiple_of(2) {
         return None;
     }
-    let payload = &bytes[4..];
-    let mut units = Vec::with_capacity(payload.len() / 2);
-    for chunk in payload.as_chunks::<2>().0 {
-        let code = u16::from_le_bytes(*chunk);
-        if code == 0 {
-            break;
-        }
-        units.push(code);
+    let (terminated, end) = bytes[4..].split_at(bytes.len() - 6);
+    if end != [0, 0] {
+        return None;
     }
-    let decoded = String::from_utf16(&units).ok()?;
-    let trimmed = decoded.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+    let units: Vec<u16> = terminated
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    if units.is_empty() || units.contains(&0) {
+        return None;
     }
+    String::from_utf16(&units).ok()
 }
 
 pub fn load_handoff(bytes: Option<&[u8]>, cmdline: &str) -> HandoffLoad {
@@ -87,10 +250,15 @@ pub fn load_handoff(bytes: Option<&[u8]>, cmdline: &str) -> HandoffLoad {
         expected_sha256: cmdline_value(cmdline, "sbm.handoff_sha256"),
         ..HandoffContext::default()
     };
-    verify_handoff(bytes, &ctx)
+    let mut load = verify_handoff(bytes, &ctx);
+    if load.verified {
+        load.detail.push_str(" [legacy standalone diagnostic]");
+        load.verified = false;
+    }
+    load
 }
 
-pub fn verify_handoff(bytes: Option<&[u8]>, ctx: &HandoffContext) -> HandoffLoad {
+fn verify_handoff(bytes: Option<&[u8]>, ctx: &HandoffContext) -> HandoffLoad {
     let Some(bytes) = bytes else {
         return HandoffLoad {
             payload: None,
@@ -186,6 +354,22 @@ pub fn verify_handoff(bytes: Option<&[u8]>, ctx: &HandoffContext) -> HandoffLoad
             detail: format!("handoff JSON rejected: {err}"),
         },
     }
+}
+
+pub fn select_integrated_esp(
+    candidates: &[EspCandidate],
+    partuuid: &str,
+    backing_disk: Option<&str>,
+) -> Result<EspCandidate, String> {
+    if !is_partuuid(partuuid) {
+        return Err("invalid boot ESP PARTUUID".into());
+    }
+    let backing = backing_disk.ok_or("verity backing disk is unknown")?;
+    let chosen = select_boot_esp(candidates, Some(partuuid), Some(backing))?;
+    if chosen.parent_disk.as_deref() != Some(backing) {
+        return Err("boot ESP parent is unknown".into());
+    }
+    Ok(chosen)
 }
 
 pub fn select_boot_esp(
@@ -289,18 +473,79 @@ mod tests {
     }
 
     #[test]
-    fn golden_handoff_verifies_when_the_cmdline_hash_matches() {
+    fn golden_legacy_handoff_is_diagnostic_only() {
         let bytes = golden_bytes();
         let hash = sha256_hex(&bytes);
         let loaded = load_handoff(
             Some(&bytes),
             &format!("console=tty0 sbm.handoff_sha256={hash}"),
         );
-        assert!(loaded.verified);
+        assert!(!loaded.verified);
         let payload = loaded.payload.expect("payload");
         assert_eq!(payload.schema_version, "1.0");
-        assert_eq!(payload.discovered_targets.len(), 1);
+        assert_eq!(payload.discovered_targets.len(), 4);
         assert!(loaded.detail.contains("interactive"));
+    }
+
+    #[test]
+    fn integrated_handoff_preserves_multiple_boot_targets() {
+        let bytes = golden_bytes();
+        let payload: EfiHandoffPayload = serde_json::from_slice(&bytes).unwrap();
+        let vars = [
+            (
+                BOOT_ESP_VARIABLE.into(),
+                "00000000-0000-4000-8000-0000000000e5".into(),
+            ),
+            (
+                format!("LoaderEntrySelected-{SYSTEMD_VENDOR_GUID}"),
+                crate::SLOT_A_TARGET_ID.into(),
+            ),
+            (
+                format!("SbmHandoffVersion-{SBM_VENDOR_GUID}"),
+                SCHEMA_VERSION_V1.into(),
+            ),
+            (
+                format!("SbmBootAttemptId-{SBM_VENDOR_GUID}"),
+                payload.attempt_id.clone(),
+            ),
+            (
+                format!("SbmHandoffSha256-{SBM_VENDOR_GUID}"),
+                sha256_hex(&bytes),
+            ),
+        ];
+        let load = |omitted| {
+            read_integrated(
+                |name| {
+                    vars.iter()
+                        .enumerate()
+                        .find(|(n, (var, _))| Some(*n) != omitted && var == name)
+                        .map(|(_, (_, value))| {
+                            let mut bytes = vec![6, 0, 0, 0];
+                            bytes
+                                .extend(value.encode_utf16().chain([0]).flat_map(u16::to_le_bytes));
+                            bytes
+                        })
+                },
+                Some(CpuArch::Aarch64),
+                |_| Ok(bytes.clone()),
+            )
+        };
+        let integrated = load(None);
+        assert!(integrated.verified);
+        let targets = integrated.boot_targets();
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].partition_guid, targets[1].partition_guid);
+        assert_ne!(targets[0].id, targets[1].id);
+        for target in targets {
+            let request = integrated.boot_request(target.id, 5).unwrap();
+            assert_eq!(request.attempt_id, payload.attempt_id);
+            assert!(is_uuid_v4(&request.request_id));
+        }
+        for (n, (variable, _)) in vars.iter().enumerate() {
+            let incomplete = load(Some(n));
+            assert!(!incomplete.verified, "{variable}");
+            assert!(incomplete.boot_targets().is_empty());
+        }
     }
 
     #[test]

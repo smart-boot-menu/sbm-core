@@ -474,11 +474,20 @@ fn operating_systems(snapshot: &SystemSnapshot) -> Column<'_, Message> {
             os_family_label(os.os_family),
             os.evidence
         )));
-        col = col.push(text(format!("target {}", os.id)).style(muted));
+    }
+    col = col.push(heading("Boot targets"));
+    if snapshot.boot_targets.is_empty() {
+        col = col.push(text("No boot targets available from the EFI picker.").style(muted));
+    }
+    for target in &snapshot.boot_targets {
+        col = col.push(text(target.display_name.clone()));
+        if let Some(path) = target.efi_path.as_ref() {
+            col = col.push(text(path.clone()).style(muted));
+        }
         col = col.push(
             button("Request this target on the next boot")
                 .on_press(Message::AskPower(PowerAction::BootTarget {
-                    target_id: os.id.clone(),
+                    target_id: target.id.as_str().to_owned(),
                 }))
                 .style(button::text),
         );

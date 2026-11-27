@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use sbm_types::{SbmErrorCode, StorageOperationPlan};
+use sbm_types::{BootTarget, SbmErrorCode, StorageOperationPlan};
 use serde::{Deserialize, Serialize};
 
 use crate::discover::{DiscoveredDisk, InstalledOs};
@@ -54,6 +54,8 @@ pub struct SystemSnapshot {
     pub uptime_secs: u64,
     pub disks: Vec<DiscoveredDisk>,
     pub installed_os: Vec<InstalledOs>,
+    #[serde(default)]
+    pub boot_targets: Vec<BootTarget>,
     pub nics: Vec<NicStatus>,
     pub tools: Vec<ToolReport>,
     pub handoff: String,
@@ -237,6 +239,7 @@ pub fn empty_snapshot() -> SystemSnapshot {
         uptime_secs: 0,
         disks: Vec::new(),
         installed_os: Vec::new(),
+        boot_targets: Vec::new(),
         nics: Vec::new(),
         tools: Vec::new(),
         handoff: "no EFI handoff file".to_string(),

@@ -17,7 +17,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sbm_protocol::{BootCommand, BootSuccessReport};
 use sbm_runtime::discover::{backing_disk, infer_installed_os, parse_lsblk};
-use sbm_runtime::handoff::load_handoff;
+use sbm_runtime::handoff::{
+    EspCandidate, HandoffContext, cmdline_value, decode_efivar_utf16, native_cpu_arch,
+    select_boot_esp, verify_handoff,
+};
 use sbm_runtime::hostinfo::{
     cpu_count, cpu_model, gpu_label, parse_ip_addr, parse_meminfo, parse_uptime,
     read_os_release_value, renderer_hint,
@@ -30,7 +33,9 @@ use sbm_runtime::plan::validate_plan;
 use sbm_runtime::{HandoffLoad, SBM_VERSION, SLOT_A_TARGET_ID};
 use sbm_types::{BootTargetId, ComponentKind, SCHEMA_VERSION_V1, SbmErrorCode};
 
-const ESP_TYPE: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
+const SYSTEMD_VENDOR_GUID: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
+const SBM_VENDOR_GUID: &str = "d8f4a21c-7b6e-4c91-9e32-8a5c1f0e3b40";
+const BOOT_EFI_MOUNT: &str = "/run/sbm/boot-efi";
 
 enum AfterAction {
     None,
@@ -49,17 +54,26 @@ pub fn serve() -> Result<(), String> {
     let dir = Path::new("/run/sbm");
     let _ = fs::create_dir_all(dir);
     let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o750));
+    let sbm_gid = group_gid("sbm");
+    if let Some(gid) = sbm_gid {
+        let _ = chown(dir, Some(0), Some(gid));
+    }
     let socket_path = Path::new(SOCKET_PATH);
     let _ = fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path).map_err(|err| err.to_string())?;
     let _ = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660));
-    if let Some(gid) = group_gid("sbm") {
+    if let Some(gid) = sbm_gid {
         let _ = chown(socket_path, Some(0), Some(gid));
     }
     let boot = snapshot();
     kmsg(&format!(
-        "SBM_BOOT_METRICS mode={} mem_total_kib={} mem_available_kib={} kernel={}",
-        boot.toram_mode, boot.memory.total_kib, boot.memory.available_kib, boot.kernel
+        "SBM_BOOT_METRICS mode={} mem_total_kib={} mem_available_kib={} kernel={} backing={} handoff_verified={}",
+        boot.toram_mode,
+        boot.memory.total_kib,
+        boot.memory.available_kib,
+        boot.kernel,
+        boot.backing_disk.as_deref().unwrap_or("none"),
+        boot.handoff_verified,
     ));
     eprintln!("sbm-cored listening on {SOCKET_PATH}");
     for connection in listener.incoming() {
@@ -107,9 +121,6 @@ pub fn serve() -> Result<(), String> {
 }
 
 pub fn protect_backing_device() -> bool {
-    if toram_mode() != "backing-protected" {
-        return false;
-    }
     let Some(source) = read_line("/run/sbm/root-source") else {
         return false;
     };
@@ -117,26 +128,39 @@ pub fn protect_backing_device() -> bool {
         return false;
     };
     let _ = fs::write("/run/sbm/backing-disk", format!("{disk}\n"));
+    if toram_mode() != "backing-protected" {
+        return false;
+    }
     let mounts = mount_table();
+    let esp_dev = resolve_boot_esp_candidate().ok().map(|cand| cand.path);
     let name = disk.trim_start_matches("/dev/");
     let sys = PathBuf::from("/sys/class/block").join(name);
     let Ok(entries) = fs::read_dir(&sys) else {
         return false;
     };
+    let mut protected = 0_u32;
     for entry in entries.flatten() {
         let part_name = entry.file_name().to_string_lossy().to_string();
         if !part_name.starts_with(name) || !entry.path().join("partition").exists() {
             continue;
         }
         let dev = format!("/dev/{part_name}");
+        if esp_dev.as_deref() == Some(dev.as_str()) {
+            continue;
+        }
         if mounts
             .iter()
-            .any(|(device, point)| device == &dev && point == "/efi")
+            .any(|(device, point)| device == &dev && (point == "/efi" || point == BOOT_EFI_MOUNT))
         {
             continue;
         }
         set_ro(&dev, true);
+        protected += 1;
     }
+    kmsg(&format!(
+        "SBM_PROTECT status=backing-protected backing={disk} esp={} ro_partitions={protected}",
+        esp_dev.as_deref().unwrap_or("none")
+    ));
     true
 }
 
@@ -149,9 +173,34 @@ fn handle(request: ClientRequest) -> Handled {
             after: AfterAction::None,
         },
         ClientRequest::UiReady => {
-            kmsg("SBM_UI_READY");
-            let _ = write_boot_success();
-            ack("desktop reported ready")
+            let handoff = read_handoff();
+            let root_source = read_line("/run/sbm/root-source").unwrap_or_else(|| "unknown".into());
+            let esp_path = resolve_boot_esp_candidate()
+                .map(|c| c.path)
+                .unwrap_or_else(|_| "none".into());
+            kmsg(&format!(
+                "SBM_UI_READY handoff_verified={} esp={} root_source={}",
+                handoff.verified, esp_path, root_source
+            ));
+            match write_boot_success(&handoff) {
+                Ok(Some((attempt_id, target_id))) => {
+                    kmsg(&format!(
+                        "SBM_BOOT_SUCCESS_WRITTEN attempt_id={attempt_id} target_id={target_id}"
+                    ));
+                    ack(format!("desktop ready (confirmed {attempt_id})"))
+                }
+                Ok(None) => {
+                    kmsg(&format!(
+                        "SBM_BOOT_SUCCESS_DECLINED reason={}",
+                        handoff.detail
+                    ));
+                    ack("desktop ready (handoff unverified; no confirmation written)")
+                }
+                Err(err) => {
+                    kmsg(&format!("SBM_BOOT_SUCCESS_DECLINED reason={err}"));
+                    ack(format!("desktop ready (report error: {err})"))
+                }
+            }
         }
         ClientRequest::Launch { tool } => match tool {
             LaunchTool::Gparted => match launch_gparted() {
@@ -221,8 +270,7 @@ fn snapshot() -> SystemSnapshot {
     };
     snap.toram_mode = toram_mode();
     snap.backing_protected = snap.toram_mode == "backing-protected";
-    snap.backing_disk =
-        read_line("/run/sbm/backing-disk").or_else(|| read_line("/run/sbm/root-source"));
+    snap.backing_disk = current_backing_disk();
     if let Some(json) = command_stdout(
         "/usr/bin/lsblk",
         &[
@@ -254,10 +302,7 @@ fn snapshot() -> SystemSnapshot {
     let handoff = read_handoff();
     snap.handoff = handoff.detail;
     snap.handoff_verified = handoff.verified;
-    let forced = fs::read_to_string("/efi/EFI/sbm/state/renderer")
-        .ok()
-        .map(|value| value.trim().to_string());
-    snap.renderer = renderer_hint(forced.as_deref(), Path::new("/dev/dri/renderD128").exists());
+    snap.renderer = active_renderer();
     snap.remote_enabled = remote_enabled();
     snap.remote_detail = if snap.remote_enabled {
         "wayvnc is enabled on 127.0.0.1:5900 with authentication".to_string()
@@ -267,27 +312,44 @@ fn snapshot() -> SystemSnapshot {
     snap
 }
 
+fn active_renderer() -> String {
+    if let Some(live) = read_line("/run/user/1000/sbm-renderer") {
+        return live;
+    }
+    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let forced = cmdline_value(&cmdline, "sbm.renderer").or_else(|| {
+        boot_efi_mount()
+            .ok()
+            .and_then(|root| read_line(&root.join("EFI/sbm/state/renderer").to_string_lossy()))
+    });
+    renderer_hint(forced.as_deref(), Path::new("/dev/dri/renderD128").exists())
+}
+
 fn power(action: PowerAction) -> Handled {
     match action {
-        PowerAction::Reboot => Handled {
-            response: ClientResponse::Ack {
-                message: "rebooting".to_string(),
-            },
-            after: AfterAction::Reboot,
-        },
-        PowerAction::Shutdown => Handled {
-            response: ClientResponse::Ack {
-                message: "shutting down".to_string(),
-            },
-            after: AfterAction::PowerOff,
-        },
-        PowerAction::BootManager => {
-            if let Err(err) = write_boot_command(&BootCommand::Reboot) {
-                return error(err, Some(SbmErrorCode::StorageIoError));
-            }
+        PowerAction::Reboot => {
+            kmsg("SBM_POWER_ACTION action=reboot");
             Handled {
                 response: ClientResponse::Ack {
-                    message: "requested return to the boot manager".to_string(),
+                    message: "rebooting".to_string(),
+                },
+                after: AfterAction::Reboot,
+            }
+        }
+        PowerAction::Shutdown => {
+            kmsg("SBM_POWER_ACTION action=shutdown");
+            Handled {
+                response: ClientResponse::Ack {
+                    message: "shutting down".to_string(),
+                },
+                after: AfterAction::PowerOff,
+            }
+        }
+        PowerAction::BootManager => {
+            kmsg("SBM_POWER_ACTION action=boot-manager");
+            Handled {
+                response: ClientResponse::Ack {
+                    message: "returning to the boot manager".to_string(),
                 },
                 after: AfterAction::Reboot,
             }
@@ -311,9 +373,14 @@ fn power(action: PowerAction) -> Handled {
                 one_shot: true,
                 extra_cmdline_preset: None,
             };
-            if let Err(err) = write_boot_command(&command) {
+            let bytes = match serde_json::to_vec_pretty(&command) {
+                Ok(bytes) => bytes,
+                Err(err) => return error(err.to_string(), Some(SbmErrorCode::InvalidSchema)),
+            };
+            if let Err(err) = write_esp("EFI/sbm/handoff/requested-command.json", &bytes) {
                 return error(err, Some(SbmErrorCode::StorageIoError));
             }
+            kmsg("SBM_POWER_ACTION action=boot-target");
             Handled {
                 response: ClientResponse::Ack {
                     message: "requested the next boot target".to_string(),
@@ -339,6 +406,41 @@ fn known_target(id: &str) -> bool {
         .any(|target| target.id.as_str() == id)
 }
 
+fn authorize_xwayland_root(display: &str, wayland: &str, xauthority: Option<&str>) {
+    let Some(xhost) = first_existing(&["/usr/bin/xhost", "/usr/sbin/xhost"]) else {
+        return;
+    };
+    let mut cmd = Command::new(xhost);
+    cmd.arg("+si:localuser:root")
+        .uid(1000)
+        .gid(1000)
+        .env("HOME", "/var/lib/sbm")
+        .env("USER", "sbm")
+        .env("LOGNAME", "sbm")
+        .env("XDG_RUNTIME_DIR", "/run/user/1000")
+        .env("DISPLAY", display)
+        .env("WAYLAND_DISPLAY", wayland)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(auth) = xauthority {
+        cmd.env("XAUTHORITY", auth);
+    }
+    let Ok(mut child) = cmd.spawn() else {
+        return;
+    };
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(4) {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(_) => return,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn launch_gparted() -> Result<String, String> {
     let path = first_existing(&[
         "/usr/libexec/gpartedbin",
@@ -348,6 +450,23 @@ fn launch_gparted() -> Result<String, String> {
     .ok_or_else(|| "gpartedbin is not installed".to_string())?;
     let _ = fs::create_dir_all("/run/user/0");
     let _ = fs::set_permissions("/run/user/0", fs::Permissions::from_mode(0o700));
+
+    let env = labwc_environ();
+    let display = env
+        .as_ref()
+        .and_then(|map| map.get("DISPLAY").cloned())
+        .unwrap_or_else(|| ":0".to_string());
+    let wayland = env
+        .as_ref()
+        .and_then(|map| map.get("WAYLAND_DISPLAY").cloned())
+        .unwrap_or_else(wayland_display);
+    let xauthority = env.as_ref().and_then(|map| map.get("XAUTHORITY").cloned());
+
+    // labwc runs Xwayland lazily (-terminate 10). Re-grant root access as the
+    // sbm user immediately before launching gpartedbin so a fresh Xwayland
+    // instance always authorizes the connection.
+    authorize_xwayland_root(&display, &wayland, xauthority.as_deref());
+
     let mut command = if let Some(dbus) = first_existing(&["/usr/bin/dbus-run-session"]) {
         let mut wrapped = Command::new(dbus);
         wrapped.arg("--").arg(&path);
@@ -358,27 +477,24 @@ fn launch_gparted() -> Result<String, String> {
     let log = File::create("/run/sbm/gparted.log").or_else(|_| File::open("/dev/null"));
     command
         .env("GDK_BACKEND", "x11")
-        .env("DISPLAY", ":0")
+        .env("DISPLAY", &display)
+        .env("WAYLAND_DISPLAY", &wayland)
         .env("XDG_RUNTIME_DIR", "/run/user/0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             log.unwrap_or_else(|_| File::open("/dev/null").expect("devnull")),
         ));
-    if let Some(env) = labwc_environ() {
-        for key in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"] {
-            if let Some(value) = env.get(key) {
-                command.env(key, value);
-            }
-        }
+    if let Some(auth) = &xauthority {
+        command.env("XAUTHORITY", auth);
     }
     let protected = toram_mode() == "backing-protected";
-    let disk = read_line("/run/sbm/backing-disk")
-        .or_else(|| read_line("/run/sbm/root-source").and_then(|source| resolve_disk(&source)));
+    let disk = current_backing_disk();
     if protected && let Some(disk) = disk.clone() {
         set_ro(&disk, true);
     }
     let mut child = command.spawn().map_err(|err| err.to_string())?;
+    kmsg(&format!("SBM_GPARTED_LAUNCHED pid={}", child.id()));
     thread::spawn(move || {
         let _ = child.wait();
         if protected && let Some(disk) = disk {
@@ -507,94 +623,195 @@ fn remote_enabled() -> bool {
     Path::new("/var/lib/sbm/remote.authorized").exists()
 }
 
-fn read_handoff() -> HandoffLoad {
+fn read_efivar(name: &str, guid: &str) -> Option<String> {
+    let path = format!("/sys/firmware/efi/efivars/{name}-{guid}");
+    let bytes = fs::read(path).ok()?;
+    decode_efivar_utf16(&bytes)
+}
+
+fn current_backing_disk() -> Option<String> {
+    read_line("/run/sbm/backing-disk")
+        .or_else(|| read_line("/run/sbm/root-source").and_then(|source| resolve_disk(&source)))
+}
+
+fn resolve_boot_esp_candidate() -> Result<EspCandidate, String> {
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    for path in [
-        "/efi/EFI/sbm/handoff/current.json",
-        "/boot/efi/EFI/sbm/handoff/current.json",
-        "/boot/EFI/sbm/handoff/current.json",
-    ] {
-        if let Ok(bytes) = fs::read(path) {
-            return load_handoff(Some(&bytes), &cmdline);
-        }
-    }
-    load_handoff(None, &cmdline)
-}
+    let expected_partuuid = read_efivar("LoaderDevicePartUUID", SYSTEMD_VENDOR_GUID)
+        .or_else(|| cmdline_value(&cmdline, "sbm.esp_partuuid"));
+    let backing = current_backing_disk();
 
-fn write_boot_success() -> Result<(), String> {
-    let handoff = read_handoff();
-    let attempt_id = handoff
-        .payload
-        .as_ref()
-        .map(|payload| payload.attempt_id.clone())
-        .unwrap_or_else(|| "local".to_string());
-    let report = BootSuccessReport {
-        schema_version: SCHEMA_VERSION_V1.to_string(),
-        attempt_id,
-        target_id: BootTargetId(SLOT_A_TARGET_ID.to_string()),
-        confirmed_by: ComponentKind::SbmCoreUki,
-        confirmed_at_unix: unix_now(),
-    };
-    let bytes = serde_json::to_vec_pretty(&report).map_err(|err| err.to_string())?;
-    write_esp("EFI/sbm/state/boot-success.json", &bytes)
-}
-
-fn write_boot_command(command: &BootCommand) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(command).map_err(|err| err.to_string())?;
-    write_esp("EFI/sbm/handoff/requested-command.json", &bytes)
-}
-
-fn write_esp(relative: &str, bytes: &[u8]) -> Result<(), String> {
-    ensure_efi_mounted();
-    let path = Path::new("/efi").join(relative);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).map_err(|err| err.to_string())?;
-    fs::rename(&tmp, &path).map_err(|err| err.to_string())?;
-    Ok(())
-}
-
-fn ensure_efi_mounted() {
-    if mount_table().iter().any(|(_, point)| point == "/efi") {
-        return;
-    }
-    let Some(json) = command_stdout(
+    let json = command_stdout(
         "/usr/bin/lsblk",
-        &["--json", "-b", "-o", "NAME,PATH,TYPE,PARTTYPE,FSTYPE"],
-    ) else {
-        return;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else {
-        return;
-    };
-    let Some(devices) = value.get("blockdevices").and_then(|item| item.as_array()) else {
-        return;
-    };
+        &[
+            "--json",
+            "-b",
+            "-o",
+            "NAME,PATH,TYPE,PARTTYPE,PARTUUID,FSTYPE,PKNAME",
+        ],
+    )
+    .ok_or_else(|| "lsblk unavailable for ESP discovery".to_string())?;
+    let value: serde_json::Value =
+        serde_json::from_str(&json).map_err(|err| format!("lsblk json parse failed: {err}"))?;
+    let devices = value
+        .get("blockdevices")
+        .and_then(|item| item.as_array())
+        .ok_or_else(|| "lsblk output missing blockdevices".to_string())?;
+
+    let mut candidates = Vec::new();
     for disk in devices {
+        let disk_path = disk
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         let Some(children) = disk.get("children").and_then(|item| item.as_array()) else {
             continue;
         };
         for part in children {
-            let parttype = part
-                .get("parttype")
-                .and_then(|item| item.as_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if parttype != ESP_TYPE {
-                continue;
-            }
             let Some(path) = part.get("path").and_then(|item| item.as_str()) else {
                 continue;
             };
-            let _ = fs::create_dir_all("/efi");
-            let _ = Command::new("mount")
-                .args(["-o", "rw", path, "/efi"])
-                .status();
-            return;
+            let parent = part
+                .get("pkname")
+                .and_then(|v| v.as_str())
+                .map(|pk| format!("/dev/{pk}"))
+                .or_else(|| disk_path.clone());
+            candidates.push(EspCandidate {
+                path: path.to_string(),
+                partuuid: part
+                    .get("partuuid")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                parttype: part
+                    .get("parttype")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                fstype: part
+                    .get("fstype")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                parent_disk: parent,
+            });
         }
     }
+    select_boot_esp(
+        &candidates,
+        expected_partuuid.as_deref(),
+        backing.as_deref(),
+    )
+}
+
+fn boot_efi_mount() -> Result<PathBuf, String> {
+    let esp = resolve_boot_esp_candidate()?;
+    let mounts = mount_table();
+    for (device, point) in &mounts {
+        if same_block_device(device, &esp.path)
+            && (point == "/efi" || point == BOOT_EFI_MOUNT || point == "/boot")
+        {
+            return Ok(PathBuf::from(point));
+        }
+    }
+    let efi_taken = mounts.iter().any(|(_, point)| point == "/efi");
+    let target = if efi_taken {
+        PathBuf::from(BOOT_EFI_MOUNT)
+    } else {
+        PathBuf::from("/efi")
+    };
+    fs::create_dir_all(&target).map_err(|err| err.to_string())?;
+    let status = Command::new("mount")
+        .args(["-t", "vfat", "-o", "rw", &esp.path])
+        .arg(&target)
+        .status()
+        .map_err(|err| err.to_string())?;
+    if !status.success() {
+        return Err(format!(
+            "failed to mount verified boot ESP {} at {}",
+            esp.path,
+            target.display()
+        ));
+    }
+    Ok(target)
+}
+
+fn same_block_device(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+fn read_handoff() -> HandoffLoad {
+    let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let expected_sha256 = read_efivar("SbmHandoffSha256", SBM_VENDOR_GUID)
+        .or_else(|| cmdline_value(&cmdline, "sbm.handoff_sha256"));
+    let expected_attempt_id = read_efivar("SbmBootAttemptId", SBM_VENDOR_GUID);
+    let expected_version = read_efivar("SbmHandoffVersion", SBM_VENDOR_GUID);
+    let ctx = HandoffContext {
+        expected_sha256,
+        expected_attempt_id,
+        expected_version,
+        expected_arch: native_cpu_arch(),
+    };
+    let root = match boot_efi_mount() {
+        Ok(root) => root,
+        Err(err) => {
+            return HandoffLoad {
+                payload: None,
+                verified: false,
+                detail: format!("boot ESP unresolved: {err}"),
+            };
+        }
+    };
+    let path = root.join("EFI/sbm/handoff/current.json");
+    let bytes = fs::read(&path).ok();
+    verify_handoff(bytes.as_deref(), &ctx)
+}
+
+fn write_boot_success(handoff: &HandoffLoad) -> Result<Option<(String, String)>, String> {
+    if !handoff.verified {
+        return Ok(None);
+    }
+    let Some(payload) = handoff.payload.as_ref() else {
+        return Ok(None);
+    };
+    let target_id = read_efivar("LoaderEntrySelected", SYSTEMD_VENDOR_GUID)
+        .or_else(|| read_efivar("LoaderEntrySelected", SBM_VENDOR_GUID))
+        .filter(|id| BootTargetId(id.clone()).is_valid())
+        .unwrap_or_else(|| SLOT_A_TARGET_ID.to_string());
+    let report = BootSuccessReport {
+        schema_version: SCHEMA_VERSION_V1.to_string(),
+        attempt_id: payload.attempt_id.clone(),
+        target_id: BootTargetId(target_id.clone()),
+        confirmed_by: ComponentKind::SbmCoreUki,
+        confirmed_at_unix: unix_now(),
+    };
+    let bytes = serde_json::to_vec_pretty(&report).map_err(|err| err.to_string())?;
+    write_esp("EFI/sbm/state/boot-success.json", &bytes)?;
+    Ok(Some((payload.attempt_id.clone(), target_id)))
+}
+
+fn write_esp(relative: &str, bytes: &[u8]) -> Result<(), String> {
+    let root = boot_efi_mount()?;
+    let path = root.join(relative);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = File::create(&tmp).map_err(|err| err.to_string())?;
+        file.write_all(bytes).map_err(|err| err.to_string())?;
+        file.sync_all().map_err(|err| err.to_string())?;
+    }
+    fs::rename(&tmp, &path).map_err(|err| err.to_string())?;
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    let _ = Command::new("/usr/bin/sync").status();
+    Ok(())
 }
 
 fn annotate_health(disks: &mut [sbm_runtime::DiscoveredDisk]) {
@@ -637,10 +854,14 @@ fn gpu_names() -> Vec<String> {
 }
 
 fn resolve_disk(source: &str) -> Option<String> {
-    let mut current = source.trim().to_string();
-    if current.is_empty() || current == "missing" {
+    let trimmed = source.trim();
+    if trimmed.is_empty() || trimmed == "missing" {
         return None;
     }
+    let mut current = fs::canonicalize(trimmed)
+        .ok()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| trimmed.to_string());
     for _ in 0..8 {
         let name = current.trim_start_matches("/dev/").to_string();
         let sys = PathBuf::from("/sys/class/block").join(&name);
@@ -711,8 +932,15 @@ fn labwc_environ() -> Option<std::collections::HashMap<String, String>> {
 
 fn find_comm(name: &str) -> Option<i32> {
     for entry in fs::read_dir("/proc").ok()?.flatten() {
-        let pid: i32 = entry.file_name().to_str()?.parse().ok()?;
-        let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        let Some(fname) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(pid) = fname.parse::<i32>() else {
+            continue;
+        };
+        let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) else {
+            continue;
+        };
         if comm.trim() == name {
             return Some(pid);
         }

@@ -119,7 +119,21 @@ impl App {
                 self.status = format!("unexpected reply: {other:?}");
                 Task::none()
             }
-            Message::Snapshot(Err(err)) | Message::Tools(Err(err)) | Message::Remote(Err(err)) => {
+            Message::Snapshot(Err(err)) => {
+                self.status = err;
+                if self.snapshot.is_none() {
+                    Task::perform(
+                        async {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            transact(&ClientRequest::Snapshot)
+                        },
+                        Message::Snapshot,
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+            Message::Tools(Err(err)) | Message::Remote(Err(err)) => {
                 self.status = err;
                 Task::none()
             }
@@ -257,6 +271,7 @@ impl App {
                 "Backing disk",
                 snapshot.backing_disk.as_deref().unwrap_or("none recorded"),
             ),
+            fact("Disks", disks_summary(snapshot)),
             fact("Handoff", &snapshot.handoff),
             fact("Renderer", &snapshot.renderer),
             fact("Remote", &snapshot.remote_detail),
@@ -339,7 +354,10 @@ impl App {
             fact("Hostname", &snapshot.hostname),
             fact("Architecture", &snapshot.arch),
             fact("Uptime", format!("{} s", snapshot.uptime_secs)),
-            fact("Handoff verified", if snapshot.handoff_verified { "yes" } else { "no" }),
+            fact(
+                "Handoff verified",
+                if snapshot.handoff_verified { "yes" } else { "no" }
+            ),
             fact("Renderer", &snapshot.renderer),
             text("Software rendering: boot with sbm.renderer=software or write \"software\" to \\EFI\\sbm\\state\\renderer.")
                 .style(muted),
@@ -381,6 +399,18 @@ impl App {
         }
         col
     }
+}
+
+fn disks_summary(snapshot: &SystemSnapshot) -> String {
+    if snapshot.disks.is_empty() {
+        return "none reported".to_string();
+    }
+    let parts: Vec<String> = snapshot
+        .disks
+        .iter()
+        .map(|disk| format!("{} ({})", disk.device_path, bytes(disk.identity.size_bytes)))
+        .collect();
+    format!("{} detected: {}", snapshot.disks.len(), parts.join(", "))
 }
 
 fn storage(snapshot: &SystemSnapshot) -> Column<'_, Message> {

@@ -18,7 +18,14 @@ for arg in $(cat /proc/cmdline 2>/dev/null); do
     esac
 done
 
-MEM_KIB=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || echo 0)
+MEM_KIB=0
+while read -r key val _rest; do
+    if [ "$key" = "MemTotal:" ]; then
+        MEM_KIB=$val
+        break
+    fi
+done < /proc/meminfo 2>/dev/null || true
+
 SRC=$(findmnt -n -o SOURCE /sysroot 2>/dev/null || true)
 SRC=$(printf '%s' "$SRC" | tr -d '[:space:]')
 if [ -z "$SRC" ]; then
@@ -49,7 +56,13 @@ fi
 if [ "$copy_ok" -eq 1 ]; then
     modprobe loop 2>/dev/null || true
     modprobe erofs 2>/dev/null || true
-    IMG=/run/sbm/root.erofs
+    mkdir -p /run/sbm/ramroot
+    TMPFS_SIZE=$((SIZE + 16777216))
+    if mount -t tmpfs -o "size=${TMPFS_SIZE},mode=0755" tmpfs /run/sbm/ramroot 2>/dev/null; then
+        IMG=/run/sbm/ramroot/root.erofs
+    else
+        IMG=/run/sbm/root.erofs
+    fi
     if dd if="$SRC" of="$IMG" bs=4194304 status=none; then
         mkdir -p /run/old-sysroot
         if mount --move /sysroot /run/old-sysroot && mount -t erofs -o ro,loop "$IMG" /sysroot; then
@@ -57,13 +70,15 @@ if [ "$copy_ok" -eq 1 ]; then
             printf '%s\n' resident > "$MARKER"
             printf '%s\n' "$SRC" > /run/sbm/root-source
             printf '%s\n' "$SIZE" > /run/sbm/root-bytes
-            echo "<6>SBM_TORAM_MODE=resident" > /dev/kmsg 2>/dev/null || true
+            echo "<6>SBM_TORAM_MODE=resident src=${SRC} bytes=${SIZE} mem_kib=${MEM_KIB}" > /dev/kmsg 2>/dev/null || true
             exit 0
         fi
         if ! findmnt /sysroot >/dev/null 2>&1; then
             mount --move /run/old-sysroot /sysroot 2>/dev/null || mount -t erofs -o ro "$SRC" /sysroot 2>/dev/null || true
         fi
     fi
+    rm -f "$IMG" 2>/dev/null || true
+    umount /run/sbm/ramroot 2>/dev/null || true
 fi
 
 printf '%s\n' backing-protected > "$MARKER"

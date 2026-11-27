@@ -1,7 +1,7 @@
 [Unit]
 Description=SBM labwc session
-After=systemd-user-sessions.service sbm-cored.service
-Wants=sbm-cored.service
+After=systemd-logind.service systemd-user-sessions.service sbm-cored.service
+Wants=systemd-logind.service sbm-cored.service
 Conflicts=getty@tty1.service display-manager.service
 After=getty@tty1.service
 
@@ -10,6 +10,9 @@ User=sbm
 Group=sbm
 SupplementaryGroups=video render input
 TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
 StandardInput=tty
 StandardOutput=journal
 StandardError=journal
@@ -17,6 +20,10 @@ PAMName=sbm-session
 WorkingDirectory=/var/lib/sbm
 Environment=HOME=/var/lib/sbm
 Environment=USER=sbm
+Environment=XDG_SEAT=seat0
+Environment=XDG_VTNR=1
+Environment=XDG_SESSION_CLASS=user
+Environment=XDG_SESSION_TYPE=wayland
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 ExecStart=/usr/lib/sbm/start-session
 Restart=on-failure

@@ -1,7 +1,9 @@
 #!/bin/sh
 # Allow the root-owned GParted process to use this user's XWayland display.
+# sbm-cored also refreshes xhost right before spawning GParted because labwc
+# runs Xwayland lazily (-terminate 10).
 i=0
-while [ "$i" -lt 50 ]; do
+while [ "$i" -lt 25 ]; do
     if xhost +si:localuser:root >/dev/null 2>&1; then
         break
     fi
@@ -9,6 +11,6 @@ while [ "$i" -lt 50 ]; do
     sleep 0.2
 done
 while true; do
-    sbm-ui || true
+    sbm-ui 2>>/run/user/1000/sbm-ui.log || true
     sleep 1
 done

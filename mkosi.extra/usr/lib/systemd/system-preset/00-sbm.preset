@@ -9,5 +9,4 @@ enable iwd.service
 enable sbm-protect.service
 enable sbm-cored.service
 enable sbm-session.service
-enable sbm-smoke.service
 disable sbm-wayvnc.service

@@ -133,6 +133,7 @@ impl HandoffLoad {
                     && !target.hidden
                     && target.verified_signature != Some(false)
                     && target.kind != BootTargetKind::SbmCore
+                    && target.kind != BootTargetKind::FirmwareSetup
                     && !target.id.as_str().starts_with("os:")
                     && !target.id.as_str().starts_with("sbm-core:")
                     && targets.iter().filter(|other| other.id == target.id).count() == 1
@@ -646,5 +647,30 @@ mod tests {
 
         // Ambiguous without PARTUUID or backing disk is rejected.
         assert!(select_boot_esp(&list, None, None).is_err());
+    }
+
+    #[test]
+    fn firmware_setup_target_is_filtered_from_boot_targets() {
+        let mut payload: EfiHandoffPayload = serde_json::from_slice(&golden_bytes()).unwrap();
+        let mut fw = payload.discovered_targets[0].clone();
+        fw.id = BootTargetId("firmware-setup".to_string());
+        fw.display_name = "UEFI Firmware Settings".to_string();
+        fw.kind = BootTargetKind::FirmwareSetup;
+        fw.hidden = false;
+        payload.discovered_targets.push(fw);
+        let load = HandoffLoad {
+            payload: Some(payload),
+            verified: true,
+            detail: "ok".to_string(),
+        };
+        assert!(
+            load.boot_targets()
+                .iter()
+                .all(|t| t.kind != BootTargetKind::FirmwareSetup)
+        );
+        let err = load
+            .boot_request(BootTargetId("firmware-setup".to_string()), 1_700_000_000)
+            .unwrap_err();
+        assert_eq!(err.1, SbmErrorCode::TargetNotFound);
     }
 }

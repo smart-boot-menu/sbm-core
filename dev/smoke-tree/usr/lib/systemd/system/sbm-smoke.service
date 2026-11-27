@@ -1,5 +1,5 @@
 [Unit]
-Description=SBM disposable-disk smoke checks
+Description=SBM disposable-disk smoke checks (dev-only)
 ConditionPathExists=/efi/EFI/sbm/state/smoke
 After=sbm-session.service sbm-cored.service
 RequiresMountsFor=/efi

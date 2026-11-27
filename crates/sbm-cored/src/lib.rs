@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::{PermissionsExt, chown};
@@ -12,6 +13,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -484,17 +486,25 @@ fn launch_gparted() -> Result<String, String> {
         command.env("XAUTHORITY", auth);
     }
     let protected = toram_mode() == "backing-protected";
-    let disk = current_backing_disk();
-    if protected && let Some(disk) = disk.clone() {
-        set_ro(&disk, true);
-    }
-    let mut child = command.spawn().map_err(|err| err.to_string())?;
+    let lease = if protected {
+        let disk = current_backing_disk().ok_or_else(|| {
+            "backing-protected mode could not resolve the recovery backing disk; refusing to start GParted".to_string()
+        })?;
+        Some(GpartedDiskLease::acquire(disk)?)
+    } else {
+        None
+    };
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            drop(lease);
+            return Err(err.to_string());
+        }
+    };
     kmsg(&format!("SBM_GPARTED_LAUNCHED pid={}", child.id()));
     thread::spawn(move || {
         let _ = child.wait();
-        if protected && let Some(disk) = disk {
-            set_ro(&disk, false);
-        }
+        drop(lease);
     });
     Ok(if protected {
         "GParted started through XWayland. The boot disk is held read-only because this system is not RAM-resident.".to_string()
@@ -576,7 +586,7 @@ fn probe_args(name: &str) -> Option<&'static [&'static str]> {
 
 fn enable_remote() -> Result<String, String> {
     let _ = fs::create_dir_all("/var/lib/sbm");
-    let password = random_password();
+    let password = random_password()?;
     let config = format!(
         "address=127.0.0.1\nport=5900\nenable_auth=true\nusername=sbm\npassword={password}\n"
     );
@@ -884,14 +894,98 @@ fn resolve_disk(source: &str) -> Option<String> {
     None
 }
 
-fn set_ro(dev: &str, ro: bool) {
+#[derive(Default)]
+struct BackingRoTracker {
+    counts: HashMap<String, usize>,
+}
+
+impl BackingRoTracker {
+    fn acquire_with<F>(&mut self, disk: &str, mut apply_ro: F) -> Result<(), String>
+    where
+        F: FnMut(&str, bool) -> Result<(), String>,
+    {
+        let count = self.counts.entry(disk.to_string()).or_insert(0);
+        if *count == 0 {
+            apply_ro(disk, true)?;
+        }
+        *count += 1;
+        Ok(())
+    }
+
+    fn release_with<F>(&mut self, disk: &str, mut on_last_release: F)
+    where
+        F: FnMut(&str),
+    {
+        if let Some(count) = self.counts.get_mut(disk) {
+            if *count > 1 {
+                *count -= 1;
+                return;
+            }
+            self.counts.remove(disk);
+            on_last_release(disk);
+        }
+    }
+
+    #[cfg(test)]
+    fn active_count(&self, disk: &str) -> usize {
+        self.counts.get(disk).copied().unwrap_or(0)
+    }
+}
+
+static GPARTED_RO_TRACKER: OnceLock<Mutex<BackingRoTracker>> = OnceLock::new();
+
+fn gparted_ro_tracker() -> &'static Mutex<BackingRoTracker> {
+    GPARTED_RO_TRACKER.get_or_init(|| Mutex::new(BackingRoTracker::default()))
+}
+
+struct GpartedDiskLease {
+    disk: String,
+}
+
+impl GpartedDiskLease {
+    fn acquire(disk: String) -> Result<Self, String> {
+        let mut guard = gparted_ro_tracker()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.acquire_with(&disk, set_ro_checked)?;
+        Ok(Self { disk })
+    }
+}
+
+impl Drop for GpartedDiskLease {
+    fn drop(&mut self) {
+        let mut guard = gparted_ro_tracker()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.release_with(&self.disk, |disk| {
+            set_ro(disk, false);
+            // Re-assert non-ESP partition read-only protection immediately after
+            // clearing the whole-disk lock so backing root/verity partitions
+            // stay protected under all failure and exit paths.
+            let _ = protect_backing_device();
+        });
+    }
+}
+
+fn set_ro_checked(dev: &str, ro: bool) -> Result<(), String> {
     if !dev.starts_with("/dev/") {
-        return;
+        return Err(format!("invalid block device path {dev}"));
     }
     let flag = if ro { "--setro" } else { "--setrw" };
     let bin = first_existing(&["/usr/sbin/blockdev", "/usr/bin/blockdev"])
         .unwrap_or_else(|| "blockdev".into());
-    let _ = Command::new(bin).args([flag, dev]).status();
+    let status = Command::new(bin)
+        .args([flag, dev])
+        .status()
+        .map_err(|err| format!("blockdev {flag} {dev} failed: {err}"))?;
+    if !status.success() {
+        return Err(format!("blockdev {flag} {dev} exited with {status}"));
+    }
+    Ok(())
+}
+
+fn set_ro(dev: &str, ro: bool) {
+    let _ = set_ro_checked(dev, ro);
 }
 
 fn mount_table() -> Vec<(String, String, String)> {
@@ -1022,21 +1116,22 @@ fn first_existing(paths: &[&str]) -> Option<String> {
         .find(|path| Path::new(path).exists())
 }
 
-fn random_password() -> String {
+fn random_password_from_reader<R: Read>(reader: &mut R) -> Result<String, String> {
     let mut bytes = [0_u8; 16];
-    if let Ok(mut file) = File::open("/dev/urandom") {
-        let _ = file.read_exact(&mut bytes);
-    } else {
-        bytes = [
-            0x53, 0x42, 0x4d, 0x2d, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
-            0xbb, 0xcc,
-        ];
-    }
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|err| format!("failed to read entropy for remote access password: {err}"))?;
     const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-    bytes
+    Ok(bytes
         .iter()
         .map(|byte| ALPHABET[(*byte as usize) % ALPHABET.len()] as char)
-        .collect()
+        .collect())
+}
+
+fn random_password() -> Result<String, String> {
+    let mut file = File::open("/dev/urandom")
+        .map_err(|err| format!("failed to open /dev/urandom for remote access password: {err}"))?;
+    random_password_from_reader(&mut file)
 }
 
 fn delayed_systemctl(args: &[&str]) {
@@ -1122,4 +1217,128 @@ fn peer_allowed(stream: &UnixStream) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn peer_allowed(_stream: &UnixStream) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gparted_ro_tracker_refcounts_concurrent_instances() {
+        let mut tracker = BackingRoTracker::default();
+        let mut events: Vec<(String, bool)> = Vec::new();
+
+        tracker
+            .acquire_with("/dev/sda", |disk, ro| {
+                events.push((disk.to_string(), ro));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(tracker.active_count("/dev/sda"), 1);
+
+        // Second concurrent instance reuses the active RO hold without re-issuing blockdev.
+        tracker
+            .acquire_with("/dev/sda", |disk, ro| {
+                events.push((disk.to_string(), ro));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(tracker.active_count("/dev/sda"), 2);
+        assert_eq!(events, vec![("/dev/sda".to_string(), true)]);
+
+        // First instance exits: whole-disk RO must remain engaged.
+        tracker.release_with("/dev/sda", |disk| {
+            events.push((disk.to_string(), false));
+        });
+        assert_eq!(tracker.active_count("/dev/sda"), 1);
+        assert_eq!(events, vec![("/dev/sda".to_string(), true)]);
+
+        // Last instance exits: whole-disk RO clears once.
+        tracker.release_with("/dev/sda", |disk| {
+            events.push((disk.to_string(), false));
+        });
+        assert_eq!(tracker.active_count("/dev/sda"), 0);
+        assert_eq!(
+            events,
+            vec![
+                ("/dev/sda".to_string(), true),
+                ("/dev/sda".to_string(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn gparted_ro_tracker_rolls_back_failed_spawn_without_dropping_other_holders() {
+        let mut tracker = BackingRoTracker::default();
+        let mut releases = 0usize;
+
+        // Single instance acquire + spawn failure -> immediate rollback clears RO.
+        tracker
+            .acquire_with("/dev/sda", |_disk, _ro| Ok(()))
+            .unwrap();
+        tracker.release_with("/dev/sda", |_| releases += 1);
+        assert_eq!(tracker.active_count("/dev/sda"), 0);
+        assert_eq!(releases, 1);
+
+        // First instance active, second acquire + spawn failure -> stays RO.
+        tracker
+            .acquire_with("/dev/sda", |_disk, _ro| Ok(()))
+            .unwrap();
+        tracker
+            .acquire_with("/dev/sda", |_disk, _ro| Ok(()))
+            .unwrap();
+        tracker.release_with("/dev/sda", |_| releases += 1);
+        assert_eq!(tracker.active_count("/dev/sda"), 1);
+        assert_eq!(releases, 1);
+
+        // First instance exits -> now releases.
+        tracker.release_with("/dev/sda", |_| releases += 1);
+        assert_eq!(tracker.active_count("/dev/sda"), 0);
+        assert_eq!(releases, 2);
+    }
+
+    #[test]
+    fn gparted_ro_tracker_fails_closed_when_setro_fails() {
+        let mut tracker = BackingRoTracker::default();
+        let err = tracker
+            .acquire_with("/dev/sda", |_disk, _ro| Err("blockdev failed".into()))
+            .unwrap_err();
+        assert!(err.contains("blockdev failed"));
+        assert_eq!(tracker.active_count("/dev/sda"), 0);
+    }
+
+    #[test]
+    fn random_password_fails_closed_on_short_entropy() {
+        let mut empty: &[u8] = &[];
+        assert!(random_password_from_reader(&mut empty).is_err());
+
+        let mut short: &[u8] = &[1, 2, 3];
+        assert!(random_password_from_reader(&mut short).is_err());
+
+        let mut ok: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        let pw = random_password_from_reader(&mut ok).unwrap();
+        assert_eq!(pw.len(), 16);
+    }
+
+    #[test]
+    fn production_mkosi_extra_contains_no_smoke_service_or_script() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let extra = manifest_dir.join("../../mkosi.extra");
+        let preset = fs::read_to_string(extra.join("usr/lib/systemd/system-preset/00-sbm.preset"))
+            .expect("read 00-sbm.preset");
+        assert!(
+            !preset.contains("sbm-smoke"),
+            "production 00-sbm.preset must not reference sbm-smoke"
+        );
+        assert!(
+            !extra
+                .join("usr/lib/systemd/system/sbm-smoke.service")
+                .exists(),
+            "production mkosi.extra must not ship sbm-smoke.service"
+        );
+        assert!(
+            !extra.join("usr/lib/sbm/sbm-smoke.sh").exists(),
+            "production mkosi.extra must not ship sbm-smoke.sh"
+        );
+    }
 }

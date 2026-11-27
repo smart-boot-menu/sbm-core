@@ -8,7 +8,7 @@ fi
 if command -v fc-cache >/dev/null 2>&1; then
     fc-cache -f || true
 fi
-chmod 755 /usr/lib/sbm/start-session /usr/lib/sbm/sbm-smoke.sh \
+chmod 755 /usr/lib/sbm/start-session \
     /var/lib/sbm/.config/labwc/autostart 2>/dev/null || true
 ln -sfn /usr/lib/systemd/system/multi-user.target /etc/systemd/system/default.target
 if [ -n "${OUTPUTDIR:-}" ] && [ -d "$OUTPUTDIR" ]; then

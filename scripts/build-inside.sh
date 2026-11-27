@@ -10,6 +10,8 @@
 #                      0 for release). Production mkosi.conf remains Incremental=no.
 #   SBM_COMPRESS       1 to produce .raw.zst via zstd -19 (default 0 for dev/integration,
 #                      1 for release).
+#   SBM_ENABLE_SMOKE   1 to inject dev/smoke-tree (sbm-smoke.service) for dev-only
+#                      testing. Default 0; forbidden when SBM_BUILD_PROFILE=release.
 #   CARGO_BUILD_JOBS   Defaults to 1 (<5 GiB RAM) or 2 (>=5 GiB RAM).
 set -euo pipefail
 export HOME="${HOME:-/home/builder}"
@@ -21,6 +23,7 @@ source "${HOME}/.cargo/env"
 
 build_t0=$(date +%s)
 profile=${SBM_BUILD_PROFILE:-dev}
+enable_smoke=${SBM_ENABLE_SMOKE:-0}
 case "$profile" in
     dev|integration)
         default_incremental=1
@@ -32,6 +35,10 @@ case "$profile" in
         esac
         ;;
     release)
+        if [ "$enable_smoke" = "1" ]; then
+            echo "SBM_ENABLE_SMOKE=1 is forbidden when SBM_BUILD_PROFILE=release" >&2
+            exit 2
+        fi
         default_incremental=0
         default_compress=1
         default_arches="arm64 x86-64"
@@ -54,7 +61,7 @@ else
 fi
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$default_jobs}"
 
-echo "sbm-core build: profile=${profile} arches=[${arches}] incremental=${incremental} compress=${compress} jobs=${CARGO_BUILD_JOBS}"
+echo "sbm-core build: profile=${profile} arches=[${arches}] incremental=${incremental} compress=${compress} smoke=${enable_smoke} jobs=${CARGO_BUILD_JOBS}"
 
 stage() {
     local triple=$1
@@ -87,9 +94,14 @@ fi
 chmod 600 mkosi.key
 chmod 755 mkosi.postinst.chroot mkosi.postoutput \
     mkosi.extra/usr/lib/sbm/start-session \
-    mkosi.extra/usr/lib/sbm/sbm-smoke.sh \
     mkosi.extra/var/lib/sbm/.config/labwc/autostart \
     image/initrd-extra/usr/lib/sbm/sbm-toram.sh
+
+mkosi_extra_args=()
+if [ "$enable_smoke" = "1" ]; then
+    chmod 755 "${root}/dev/smoke-tree/usr/lib/sbm/sbm-smoke.sh"
+    mkosi_extra_args+=("--extra-tree=${root}/dev/smoke-tree")
+fi
 
 mkdir -p build/images build/mkosi-cache build/mkosi-pkgcache build/mkosi-build
 version=$(tr -d '[:space:]' < mkosi.version)
@@ -121,7 +133,8 @@ for arch in $arches; do
     sudo /usr/local/bin/mkosi --force build \
         --architecture="$arch" \
         "$mkosi_inc_flag" \
-        --extra-tree="${root}/build/staging/${triple}"
+        --extra-tree="${root}/build/staging/${triple}" \
+        "${mkosi_extra_args[@]}"
     mkosi_secs=$(( mkosi_secs + $(date +%s) - t0 ))
 
     t0=$(date +%s)

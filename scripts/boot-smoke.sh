@@ -217,6 +217,7 @@ print("markers:", ", ".join(found) or "none")
 PY
 
 wait "$pid" 2>/dev/null || true
+pid=""
 for ppm in "$evidence"/screen.ppm "$evidence"/screen-smoke.ppm; do
     if [ -f "$ppm" ]; then
         sips -s format png "$ppm" --out "${ppm%.ppm}.png" >/dev/null

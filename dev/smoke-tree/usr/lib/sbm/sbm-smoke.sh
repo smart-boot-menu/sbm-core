@@ -1,4 +1,6 @@
 #!/bin/sh
+# Development-only smoke helper. Excluded from release images and injected only
+# when SBM_ENABLE_SMOKE=1 with a non-release SBM_BUILD_PROFILE.
 # Runs only when /efi/EFI/sbm/state/smoke exists. Snapshot first, then GParted.
 set -u
 mkdir -p /efi/EFI/sbm/state /run/sbm

@@ -116,7 +116,7 @@ if [ ! -f "${dir}/disk.qcow2" ] || [ ! -f "${dir}/seed.iso" ]; then
 fi
 
 mkdir -p "$dir"
-hold=$(sbm_reserve build "$mem" "$cpus" "$root")
+hold=$(SBM_DETACHED=1 sbm_reserve build "$mem" "$cpus" "$root")
 printf '%s\n' "$hold" >"${dir}/reservation.id"
 cd "$dir"
 # A new session so the launching shell can exit without killing QEMU.

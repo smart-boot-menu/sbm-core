@@ -1,6 +1,6 @@
 #!/bin/bash
-# Start or stop the Fedora builder. The disk, package cache, and Cargo
-# target stay in build/builder/disk.qcow2 across restarts.
+# Start, stop, inspect, or trim the Fedora builder. The disk, package cache,
+# and Cargo target stay in build/builder/disk.qcow2 across restarts.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck disable=SC1091
@@ -81,9 +81,22 @@ case "$action" in
         fi
         exit 0
         ;;
+    trim)
+        pid=$(qemu_pid || true)
+        if [ -z "$pid" ]; then
+            echo "builder is not running; start it before trimming" >&2
+            exit 1
+        fi
+        ssh -i "${dir}/id_ed25519" -p 2222 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile="${dir}/known_hosts" \
+            -o ConnectTimeout=8 \
+            builder@127.0.0.1 'sudo fstrim -av'
+        exit 0
+        ;;
     start) ;;
     *)
-        echo "usage: start-builder.sh [start|stop|status]" >&2
+        echo "usage: start-builder.sh [start|stop|status|trim]" >&2
         exit 2
         ;;
 esac
@@ -107,6 +120,8 @@ hold=$(sbm_reserve build "$mem" "$cpus" "$root")
 printf '%s\n' "$hold" >"${dir}/reservation.id"
 cd "$dir"
 # A new session so the launching shell can exit without killing QEMU.
+# discard=unmap,detect-zeroes=unmap allows guest fstrim to punch holes back
+# into the host APFS QCOW2 file without offline qemu-img convert.
 python3 -c 'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
     /opt/homebrew/bin/qemu-system-aarch64 \
     -name sbm-builder \
@@ -115,11 +130,12 @@ python3 -c 'import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' \
     -smp "$cpus" \
     -m "$mem" \
     -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd \
-    -drive if=none,id=hd,file=disk.qcow2,format=qcow2 \
+    -drive if=none,id=hd,file=disk.qcow2,format=qcow2,discard=unmap,detect-zeroes=unmap \
     -device virtio-blk-pci,drive=hd \
     -drive if=none,id=cidata,file=seed.iso,format=raw,media=cdrom,readonly=on \
     -device virtio-scsi-pci,id=scsi0 \
     -device scsi-cd,bus=scsi0.0,drive=cidata \
+    -device virtio-balloon-pci,free-page-reporting=on,deflate-on-oom=on \
     -netdev user,id=net,hostfwd=tcp:127.0.0.1:2222-:22 \
     -device virtio-net-pci,netdev=net \
     -display none \

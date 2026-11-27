@@ -1,0 +1,15 @@
+[package]
+name = "sbm-sim"
+description = "Desktop-only stand-in for sbm-cored that serves a simulated computer to the real sbm-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sbm-protocol.workspace = true
+sbm-runtime = { path = "../sbm-runtime" }
+sbm-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true

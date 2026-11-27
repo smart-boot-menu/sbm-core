@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Desktop development against `sbm-sim`; see crates/sbm-sim.
+native-sim = ["sbm-runtime/native-sim"]
+
 [dependencies]
 iced.workspace = true
 sbm-runtime = { path = "../sbm-runtime" }

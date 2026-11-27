@@ -1,0 +1,12 @@
+[
+  {
+    "addr_info": [
+      {
+        "local": "192.168.1.42"
+      }
+    ],
+    "address": "02:53:42:4d:00:00",
+    "ifname": "wlan0",
+    "operstate": "UP"
+  }
+]

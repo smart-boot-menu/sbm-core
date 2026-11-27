@@ -4,6 +4,13 @@ members = [
     "crates/sbm-runtime",
     "crates/sbm-cored",
     "crates/sbm-ui",
+    "crates/sbm-sim",
+]
+# sbm-sim is a desktop development tool; image builds compile default members only.
+default-members = [
+    "crates/sbm-runtime",
+    "crates/sbm-cored",
+    "crates/sbm-ui",
 ]
 
 [workspace.package]

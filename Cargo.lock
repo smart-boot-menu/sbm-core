@@ -2492,6 +2492,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbm-sim"
+version = "0.1.0"
+dependencies = [
+ "sbm-protocol",
+ "sbm-runtime",
+ "sbm-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sbm-types"
 version = "0.1.0"
 dependencies = [

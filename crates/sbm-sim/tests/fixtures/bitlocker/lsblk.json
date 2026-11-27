@@ -1,0 +1,123 @@
+{
+  "blockdevices": [
+    {
+      "children": [
+        {
+          "fsavail": 178257920,
+          "fstype": "vfat",
+          "label": null,
+          "log-sec": 512,
+          "mountpoint": "/run/sbm/sim/nvme0n1p1",
+          "name": "nvme0n1p1",
+          "partlabel": "EFI system partition",
+          "parttype": "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+          "partuuid": "8f1b132c-c20c-48b2-acca-3338ef4782c5",
+          "path": "/dev/nvme0n1p1",
+          "rm": false,
+          "ro": false,
+          "size": 272629760,
+          "start": 2048,
+          "type": "part"
+        },
+        {
+          "fsavail": null,
+          "fstype": null,
+          "label": null,
+          "log-sec": 512,
+          "mountpoint": null,
+          "name": "nvme0n1p2",
+          "partlabel": "Microsoft reserved partition",
+          "parttype": "e3c9e316-0b5c-4db8-817d-f92df00215ae",
+          "partuuid": "81d106b8-7147-4f7c-a8fc-3a2c7d498ef5",
+          "path": "/dev/nvme0n1p2",
+          "rm": false,
+          "ro": false,
+          "size": 16777216,
+          "start": 534528,
+          "type": "part"
+        },
+        {
+          "fsavail": null,
+          "fstype": "BitLocker",
+          "label": null,
+          "log-sec": 512,
+          "mountpoint": null,
+          "name": "nvme0n1p3",
+          "partlabel": "Basic data partition",
+          "parttype": "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7",
+          "partuuid": "95feec97-bb78-44f5-aa0b-c84396564262",
+          "path": "/dev/nvme0n1p3",
+          "rm": false,
+          "ro": false,
+          "size": 504658657280,
+          "start": 567296,
+          "type": "part"
+        },
+        {
+          "fsavail": null,
+          "fstype": "ntfs",
+          "label": null,
+          "log-sec": 512,
+          "mountpoint": null,
+          "name": "nvme0n1p4",
+          "partlabel": "Windows recovery",
+          "parttype": "de94bba4-06d1-4d40-a16a-bfd50179d6ac",
+          "partuuid": "7054e68e-e490-407a-adaa-5a53805dc43c",
+          "path": "/dev/nvme0n1p4",
+          "rm": false,
+          "ro": false,
+          "size": 1073741824,
+          "start": 986228736,
+          "type": "part"
+        }
+      ],
+      "hotplug": false,
+      "log-sec": 512,
+      "model": "Samsung MZ9L4512HBLU 512GB",
+      "name": "nvme0n1",
+      "path": "/dev/nvme0n1",
+      "ptuuid": "9a72cffc-e6de-45ef-a371-070019d8dea7",
+      "rm": false,
+      "ro": false,
+      "serial": "SIM-9a72cffc",
+      "size": 512000000000,
+      "tran": "nvme",
+      "type": "disk",
+      "wwn": null
+    },
+    {
+      "children": [
+        {
+          "fsavail": null,
+          "fstype": "vfat",
+          "label": null,
+          "log-sec": 512,
+          "mountpoint": null,
+          "name": "sda1",
+          "partlabel": "SBM",
+          "parttype": "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+          "partuuid": "93ded48e-96ad-46a1-a2eb-23c844792efe",
+          "path": "/dev/sda1",
+          "rm": true,
+          "ro": false,
+          "size": 2147483648,
+          "start": 2048,
+          "type": "part"
+        }
+      ],
+      "hotplug": true,
+      "log-sec": 512,
+      "model": "SanDisk Ultra Flair",
+      "name": "sda",
+      "path": "/dev/sda",
+      "ptuuid": "2dda4024-b3de-4748-acda-91d87881c317",
+      "rm": true,
+      "ro": false,
+      "serial": "SIM-2dda4024",
+      "size": 32000000000,
+      "tran": "usb",
+      "type": "disk",
+      "wwn": null
+    }
+  ]
+}

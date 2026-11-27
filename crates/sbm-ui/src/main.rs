@@ -76,7 +76,11 @@ impl App {
     }
 
     fn title(&self) -> String {
-        "SBM Core".to_string()
+        if sbm_runtime::ipc::SIMULATED {
+            "SBM Core - SIMULATED native preview (no real disks)".to_string()
+        } else {
+            "SBM Core".to_string()
+        }
     }
 
     fn theme(&self) -> Theme {

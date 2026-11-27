@@ -1,0 +1,14 @@
+{
+  "arch": "x86_64",
+  "cores": 8,
+  "cpu_model": "Intel(R) Core(TM) Ultra 7 268V",
+  "gpus": [
+    "Intel Arc 140V (xe)"
+  ],
+  "hostname": "sim-dual-boot",
+  "product": "ThinkPad X1 Carbon Gen 13",
+  "vendor": "LENOVO",
+  "wireless": [
+    "wlan0"
+  ]
+}

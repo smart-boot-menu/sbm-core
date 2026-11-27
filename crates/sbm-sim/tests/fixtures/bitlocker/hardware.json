@@ -1,0 +1,14 @@
+{
+  "arch": "x86_64",
+  "cores": 8,
+  "cpu_model": "Intel(R) Core(TM) Ultra 5 236V",
+  "gpus": [
+    "Intel Arc 130V (xe)"
+  ],
+  "hostname": "sim-bitlocker",
+  "product": "Surface Laptop 7 (Intel)",
+  "vendor": "Microsoft Corporation",
+  "wireless": [
+    "wlan0"
+  ]
+}

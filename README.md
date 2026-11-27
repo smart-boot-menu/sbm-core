@@ -13,6 +13,17 @@ Independently bootable, immutable, modular, RAM-capable minimal Linux management
 - `sbm-cored` for read-only disk discovery, `DiskIdentity` matching, and `StorageOperationPlan` checks. SBM 0.1 does not execute partition changes.
 - `sbm_runtime::inspect_catalog_plan` compares an `OsInstallPlan` from `sbm-catalog` with the `OsCatalogEntry` it names. An unbound plan with an empty operation list can pass inspection and stays non-executable. A hash mismatch or a storage operation on the unbound disk is rejected. See [docs/CATALOG.md](docs/CATALOG.md).
 
+## Native development (SIMULATED)
+
+`crates/sbm-sim` is a desktop-only stand-in for `sbm-cored`. It answers the unmodified `sbm-ui` from a session directory written by `sbm-uefi`'s simulator, using the production `sbm-runtime` parsers, handoff verification and plan validation. It never runs tools, reads host disks, or changes power state. It is not a default workspace member, so image builds never compile it. The `native-sim` feature on `sbm-ui`/`sbm-runtime` only lets the shell follow `SBM_SIM_CORED_SOCKET` and mark its title SIMULATED.
+
+```
+cargo build -p sbm-sim -p sbm-ui --features sbm-ui/native-sim
+cd ../sbm-uefi && cargo xtask core --scenario multi-disk
+```
+
+See `sbm-uefi/sim/README.md`.
+
 ## Canonical Documentation & Contracts
 
 - Central coordination & roadmap: [`smart-boot-menu/sbm`](https://github.com/smart-boot-menu/sbm)

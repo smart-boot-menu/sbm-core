@@ -16,6 +16,19 @@ use crate::plan::PlanDecision;
 pub const SOCKET_PATH: &str = "/run/sbm/cored.sock";
 const MAX_MESSAGE: usize = 1024 * 1024;
 
+/// True only in development builds that talk to the `sbm-sim` daemon.
+pub const SIMULATED: bool = cfg!(feature = "native-sim");
+
+/// Socket the shell connects to. Release images always use [`SOCKET_PATH`];
+/// the `native-sim` feature lets a desktop build follow `SBM_SIM_CORED_SOCKET`.
+pub fn socket_path() -> String {
+    #[cfg(feature = "native-sim")]
+    if let Some(path) = std::env::var_os("SBM_SIM_CORED_SOCKET") {
+        return path.to_string_lossy().into_owned();
+    }
+    SOCKET_PATH.to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HardwareInfo {
     pub vendor: String,
@@ -115,8 +128,9 @@ pub enum ClientResponse {
 }
 
 pub fn transact(request: &ClientRequest) -> Result<ClientResponse, String> {
-    let mut stream = UnixStream::connect(SOCKET_PATH)
-        .map_err(|err| format!("sbm-cored is not reachable at {SOCKET_PATH}: {err}"))?;
+    let path = socket_path();
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|err| format!("sbm-cored is not reachable at {path}: {err}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(8)))
         .map_err(|err| err.to_string())?;

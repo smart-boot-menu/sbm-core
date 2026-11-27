@@ -11,6 +11,15 @@ while [ "$i" -lt 25 ]; do
     sleep 0.2
 done
 while true; do
-    sbm-ui 2>>/run/user/1000/sbm-ui.log || true
+    if sbm-ui 2>>/run/user/1000/sbm-ui.log; then
+        status=0
+    else
+        status=$?
+    fi
+    if [ "$status" -ne 0 ] && [ "${ICED_BACKEND:-}" != "tiny-skia" ]; then
+        echo "sbm-ui exited with status=${status}; falling back to ICED_BACKEND=tiny-skia" >>/run/user/1000/sbm-ui.log
+        export ICED_BACKEND=tiny-skia
+        printf 'software (wgpu fallback: tiny-skia)\n' > "${XDG_RUNTIME_DIR:-/run/user/1000}/sbm-renderer"
+    fi
     sleep 1
 done

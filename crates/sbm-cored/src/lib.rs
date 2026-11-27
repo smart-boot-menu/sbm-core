@@ -131,8 +131,24 @@ pub fn protect_backing_device() -> bool {
     if toram_mode() != "backing-protected" {
         return false;
     }
+    // Wait briefly for udev/lsblk to expose the boot ESP metadata so we never
+    // accidentally mark the boot ESP read-only before systemd mounts /boot.
+    let mut esp_dev = None;
+    for _ in 0..30 {
+        if let Ok(cand) = resolve_boot_esp_candidate() {
+            esp_dev = Some(cand.path);
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let Some(esp_path) = esp_dev else {
+        kmsg(&format!(
+            "SBM_PROTECT status=deferred backing={disk} reason=esp-unresolved"
+        ));
+        return false;
+    };
+    set_ro(&esp_path, false);
     let mounts = mount_table();
-    let esp_dev = resolve_boot_esp_candidate().ok().map(|cand| cand.path);
     let name = disk.trim_start_matches("/dev/");
     let sys = PathBuf::from("/sys/class/block").join(name);
     let Ok(entries) = fs::read_dir(&sys) else {
@@ -145,21 +161,20 @@ pub fn protect_backing_device() -> bool {
             continue;
         }
         let dev = format!("/dev/{part_name}");
-        if esp_dev.as_deref() == Some(dev.as_str()) {
+        if same_block_device(&dev, &esp_path) {
             continue;
         }
-        if mounts
-            .iter()
-            .any(|(device, point)| device == &dev && (point == "/efi" || point == BOOT_EFI_MOUNT))
-        {
+        if mounts.iter().any(|(device, point, _)| {
+            same_block_device(device, &dev)
+                && (point == "/efi" || point == BOOT_EFI_MOUNT || point == "/boot")
+        }) {
             continue;
         }
         set_ro(&dev, true);
         protected += 1;
     }
     kmsg(&format!(
-        "SBM_PROTECT status=backing-protected backing={disk} esp={} ro_partitions={protected}",
-        esp_dev.as_deref().unwrap_or("none")
+        "SBM_PROTECT status=backing-protected backing={disk} esp={esp_path} ro_partitions={protected}"
     ));
     true
 }
@@ -702,15 +717,21 @@ fn resolve_boot_esp_candidate() -> Result<EspCandidate, String> {
 
 fn boot_efi_mount() -> Result<PathBuf, String> {
     let esp = resolve_boot_esp_candidate()?;
+    set_ro(&esp.path, false);
     let mounts = mount_table();
-    for (device, point) in &mounts {
+    for (device, point, opts) in &mounts {
         if same_block_device(device, &esp.path)
             && (point == "/efi" || point == BOOT_EFI_MOUNT || point == "/boot")
         {
+            if opts.split(',').any(|o| o == "ro") {
+                let _ = Command::new("mount")
+                    .args(["-o", "remount,rw", point])
+                    .status();
+            }
             return Ok(PathBuf::from(point));
         }
     }
-    let efi_taken = mounts.iter().any(|(_, point)| point == "/efi");
+    let efi_taken = mounts.iter().any(|(_, point, _)| point == "/efi");
     let target = if efi_taken {
         PathBuf::from(BOOT_EFI_MOUNT)
     } else {
@@ -899,7 +920,7 @@ fn set_ro(dev: &str, ro: bool) {
     let _ = Command::new(bin).args([flag, dev]).status();
 }
 
-fn mount_table() -> Vec<(String, String)> {
+fn mount_table() -> Vec<(String, String, String)> {
     let text = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
     let mut rows = Vec::new();
     for line in text.lines() {
@@ -908,8 +929,12 @@ fn mount_table() -> Vec<(String, String)> {
         };
         let left_fields: Vec<&str> = left.split_whitespace().collect();
         let right_fields: Vec<&str> = right.split_whitespace().collect();
-        if left_fields.len() >= 5 && right_fields.len() >= 2 {
-            rows.push((right_fields[1].to_string(), left_fields[4].to_string()));
+        if left_fields.len() >= 6 && right_fields.len() >= 2 {
+            rows.push((
+                right_fields[1].to_string(),
+                left_fields[4].to_string(),
+                left_fields[5].to_string(),
+            ));
         }
     }
     rows
